@@ -1,0 +1,379 @@
+{
+ "version": 1,
+ "created": "2026-08-23",
+ "note": "标注粒度=source 文件级（对重切分免疫，chunk_id 会随 CHUNK_SIZE 漂移所以不用）。golden 是可接受命中集合；多 golden 用于 Recall@10。dimension：exact=精确技术词 / colloquial=口语自然语言 / business=业务域 / ops=部署运维工具 / cross=多黄金跨库。查询取材：hit_stats 高频文档反推 + 搭建手册第十章评测集 + 文档标题/标签。后续扩充直接往 queries 里加条目。",
+ "queries": [
+  {
+   "id": 1,
+   "dimension": "exact",
+   "query": "@@FETCH_STATUS 游标循环怎么写",
+   "golden": [
+    "sql-cursor-usage.md"
+   ]
+  },
+  {
+   "id": 2,
+   "dimension": "exact",
+   "query": "GetPageDataByReader statement 命名规范",
+   "golden": [
+    "ibatis-statement-naming-and-getpagedatabyreader-pitfall.md"
+   ]
+  },
+  {
+   "id": 3,
+   "dimension": "exact",
+   "query": "MERGE INTO 存在则更新不存在则插入",
+   "golden": [
+    "sql-merge-into-upsert.md"
+   ]
+  },
+  {
+   "id": 4,
+   "dimension": "exact",
+   "query": "OUTER APPLY CROSS APPLY 区别用法",
+   "golden": [
+    "sql-outer-apply-cross-apply.md"
+   ]
+  },
+  {
+   "id": 5,
+   "dimension": "exact",
+   "query": "FOR XML PATH 分组拼接字符串",
+   "golden": [
+    "sql-xml-path-and-paging.md"
+   ]
+  },
+  {
+   "id": 6,
+   "dimension": "exact",
+   "query": "按关键字查找存储过程 syscomments",
+   "golden": [
+    "sql-search-procedure-by-keyword.md"
+   ]
+  },
+  {
+   "id": 7,
+   "dimension": "exact",
+   "query": "CUBE ROLLUP 小计汇总",
+   "golden": [
+    "sql-grouping-cube-rollup-serverip.md"
+   ]
+  },
+  {
+   "id": 8,
+   "dimension": "exact",
+   "query": "PagerResult ParameterObject where 条件重复",
+   "golden": [
+    "pageresult-parameterobject-double-where-pitfall.md"
+   ]
+  },
+  {
+   "id": 9,
+   "dimension": "exact",
+   "query": "iBATIS dynamic prepend 动态SQL拼接",
+   "golden": [
+    "ibatis-dynamic-prepend-rules.md"
+   ]
+  },
+  {
+   "id": 10,
+   "dimension": "exact",
+   "query": "iBATIS resultMap 性能问题",
+   "golden": [
+    "ibatis-result-mapping-performance.md"
+   ]
+  },
+  {
+   "id": 11,
+   "dimension": "exact",
+   "query": "iBATIS parameterClass 自定义类传参",
+   "golden": [
+    "ibatis-custom-statement-parameterclass-pitfall.md"
+   ]
+  },
+  {
+   "id": 12,
+   "dimension": "exact",
+   "query": "GetDataTableByStatement ImageCommand",
+   "golden": [
+    "extnet-GetDataTableByStatement-ImageCommand.md"
+   ]
+  },
+  {
+   "id": 13,
+   "dimension": "colloquial",
+   "query": "表格行过期了标红底色怎么设置",
+   "golden": [
+    "extnet-row-highlight-expiry.md"
+   ]
+  },
+  {
+   "id": 14,
+   "dimension": "colloquial",
+   "query": "字段的中文含义去哪查",
+   "golden": [
+    "data-dictionary.md",
+    "glossary.md"
+   ]
+  },
+  {
+   "id": 15,
+   "dimension": "colloquial",
+   "query": "日期控件想默认查本月",
+   "golden": [
+    "extnet-datefield-range-and-month.md"
+   ]
+  },
+  {
+   "id": 16,
+   "dimension": "colloquial",
+   "query": "表格里的文字选不中没法复制",
+   "golden": [
+    "extnet-gridview-enabletextselection.md"
+   ]
+  },
+  {
+   "id": 17,
+   "dimension": "colloquial",
+   "query": "隐藏窗口里的悬浮提示不出来",
+   "golden": [
+    "extnet-tooltip-in-hidden-window.md"
+   ]
+  },
+  {
+   "id": 18,
+   "dimension": "colloquial",
+   "query": "切换页签后图表显示不出来",
+   "golden": [
+    "extnet-tabpanel-echarts-not-display.md"
+   ]
+  },
+  {
+   "id": 19,
+   "dimension": "colloquial",
+   "query": "点导出报错提示语言相关",
+   "golden": [
+    "extnet-export-i18n-error.md"
+   ]
+  },
+  {
+   "id": 20,
+   "dimension": "colloquial",
+   "query": "定时器重复执行和延迟执行的区别",
+   "golden": [
+    "js-setinterval-settimeout.md"
+   ]
+  },
+  {
+   "id": 21,
+   "dimension": "colloquial",
+   "query": "下拉框想边输入边过滤选项",
+   "golden": [
+    "extnet-combobox-fuzzy-search.md"
+   ]
+  },
+  {
+   "id": 22,
+   "dimension": "colloquial",
+   "query": "一次选多个文件上传",
+   "golden": [
+    "multi-file-upload-pitfalls.md"
+   ]
+  },
+  {
+   "id": 23,
+   "dimension": "business",
+   "query": "胶料消耗统计报表怎么做",
+   "golden": [
+    "semi-rubber-consumption-report.md"
+   ]
+  },
+  {
+   "id": 24,
+   "dimension": "business",
+   "query": "产出消耗日报",
+   "golden": [
+    "consumption-output-report.md"
+   ]
+  },
+  {
+   "id": 25,
+   "dimension": "business",
+   "query": "设备稼动率OEE怎么计算",
+   "golden": [
+    "equipment-utilization-oee-calculation.md"
+   ]
+  },
+  {
+   "id": 26,
+   "dimension": "business",
+   "query": "CPK SPC 计算公式",
+   "golden": [
+    "cpk-spc-calculation-formulas.md"
+   ]
+  },
+  {
+   "id": 27,
+   "dimension": "business",
+   "query": "月度合格率趋势",
+   "golden": [
+    "monthly-pass-rate-trend.md"
+   ]
+  },
+  {
+   "id": 28,
+   "dimension": "business",
+   "query": "模具状态码含义",
+   "golden": [
+    "mould-status-codes.md"
+   ]
+  },
+  {
+   "id": 29,
+   "dimension": "business",
+   "query": "换模流程步骤",
+   "golden": [
+    "mould-change-process.md"
+   ]
+  },
+  {
+   "id": 30,
+   "dimension": "business",
+   "query": "模具下线清洗记录",
+   "golden": [
+    "mould-offlinewash-detail.md"
+   ]
+  },
+  {
+   "id": 31,
+   "dimension": "business",
+   "query": "硫化日报表实现",
+   "golden": [
+    "curing-daily-report-implementation.md"
+   ]
+  },
+  {
+   "id": 32,
+   "dimension": "business",
+   "query": "班次值是从哪张表来的",
+   "golden": [
+    "shift-value-source.md"
+   ]
+  },
+  {
+   "id": 33,
+   "dimension": "ops",
+   "query": "SQL Server Agent 启动不了",
+   "golden": [
+    "sql-agent-cannot-start.md"
+   ]
+  },
+  {
+   "id": 34,
+   "dimension": "ops",
+   "query": "nginx 导入超时",
+   "golden": [
+    "nginx-iis-import-timeout.md"
+   ]
+  },
+  {
+   "id": 35,
+   "dimension": "ops",
+   "query": "openpyxl 生成的xlsx打不开",
+   "golden": [
+    "openpyxl-xlsx-compat-fix.md"
+   ]
+  },
+  {
+   "id": 36,
+   "dimension": "ops",
+   "query": "MCP 进程内存占用太高",
+   "golden": [
+    "python-mcp-memory-and-port-mutex-pitfalls.md"
+   ]
+  },
+  {
+   "id": 37,
+   "dimension": "ops",
+   "query": "RAG 知识库服务从零搭建",
+   "golden": [
+    "rag-kb-mcp-build-guide.md"
+   ]
+  },
+  {
+   "id": 38,
+   "dimension": "ops",
+   "query": "网站智能助手搭建",
+   "golden": [
+    "rag-website-assistant-build-guide.md"
+   ]
+  },
+  {
+   "id": 39,
+   "dimension": "ops",
+   "query": "桌面整理工具实现",
+   "golden": [
+    "winforms-desktop-organizer-tech-guide.md"
+   ]
+  },
+  {
+   "id": 40,
+   "dimension": "cross",
+   "query": "服务端分页数据不对",
+   "golden": [
+    "extnet-pagination-guide.md"
+   ]
+  },
+  {
+   "id": 41,
+   "dimension": "cross",
+   "query": "文件上传功能",
+   "golden": [
+    "extnet-file-upload-guide.md",
+    "multi-file-upload-pitfalls.md"
+   ]
+  },
+  {
+   "id": 42,
+   "dimension": "cross",
+   "query": "登录权限控制",
+   "golden": [
+    "main-auth-and-login.md",
+    "main-permission-system.md",
+    "button-permission.md"
+   ]
+  },
+  {
+   "id": 43,
+   "dimension": "cross",
+   "query": "建表设计规范",
+   "golden": [
+    "sql-server-table-design-principles.md"
+   ]
+  },
+  {
+   "id": 44,
+   "dimension": "cross",
+   "query": "慢查询排查优化",
+   "golden": [
+    "sql-server-performance-troubleshooting.md"
+   ]
+  },
+  {
+   "id": 45,
+   "dimension": "cross",
+   "query": "数据库日志太大 收缩 分区表",
+   "golden": [
+    "sql-partition-and-log-shrink.md"
+   ]
+  },
+  {
+   "id": 46,
+   "dimension": "cross",
+   "query": "查看正在执行的SQL 死锁",
+   "golden": [
+    "sql-running-queries-and-deadlock.md"
+   ]
+  }
+ ]
+}

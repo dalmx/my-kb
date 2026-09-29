@@ -1,0 +1,14 @@
+# RAG Knowledge Base（模块化重构版）
+# 版本锁定到实际验证过的版本，确保复刻环境一致
+langchain==1.2.13
+langchain-community==0.4.1
+langchain-text-splitters==1.1.1
+langchain-huggingface==1.2.1
+langchain-chroma==1.1.0
+chromadb==1.5.5
+pypdf>=4.0.0
+sentence-transformers==5.3.0
+python-frontmatter>=1.0.0
+jieba>=0.42.1
+rank_bm25>=0.2.2
+mcp>=1.0.0
