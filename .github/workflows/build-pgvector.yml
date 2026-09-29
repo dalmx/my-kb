@@ -9,13 +9,19 @@ jobs:
         run: |
           curl -L -o pg18.zip https://get.enterprisedb.com/postgresql/postgresql-18.1-1-windows-x64-binaries.zip
           Expand-Archive pg18.zip -DestinationPath C:\pg
+          Get-ChildItem C:\pg | Select-Object Name
       - name: Clone pgvector
         shell: cmd
         run: git clone --depth 1 --branch v0.8.0 https://github.com/pgvector/pgvector.git C:\pgvector
       - name: Build
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          for /f "tokens=*" %%i in ('"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath') do set VSPATH=%%i
+          echo Found VS at: %VSPATH%
+          call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat"
+          where cl
+          where nmake
+          if not exist C:\pg\pgsql\include\server\postgres.h (echo MISSING PG HEADERS & exit /b 1)
           cd C:\pgvector
           nmake /F Makefile.win PGROOT=C:\pg\pgsql
           nmake /F Makefile.win PGROOT=C:\pg\pgsql install
