@@ -1,0 +1,30 @@
+name: build-pgvector-pg18-win
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Download PG18 binaries
+        shell: pwsh
+        run: |
+          curl -L -o pg18.zip https://get.enterprisedb.com/postgresql/postgresql-18.1-1-windows-x64-binaries.zip
+          Expand-Archive pg18.zip -DestinationPath C:\pg
+      - name: Clone pgvector
+        shell: cmd
+        run: git clone --depth 1 --branch v0.8.0 https://github.com/pgvector/pgvector.git C:\pgvector
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio2\Enterprise\VC\Auxiliary\Buildcvars64.bat"
+          cd C:\pgvector
+          nmake /F Makefile.win PGROOT=C:\pg\pgsql
+          nmake /F Makefile.win PGROOT=C:\pg\pgsql install
+      - name: Collect
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out\lib, out\ext | Out-Null
+          Copy-Item C:\pg\pgsql\libector.dll out\lib          Copy-Item C:\pg\pgsql\share\extensionector* out\ext          Compress-Archive -Path out -DestinationPath pgvector-pg18-win.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pgvector-pg18-win
+          path: pgvector-pg18-win.zip
