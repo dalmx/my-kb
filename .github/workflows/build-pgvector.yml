@@ -12,7 +12,7 @@ jobs:
           Get-ChildItem C:\pg | Select-Object Name
       - name: Clone pgvector
         shell: cmd
-        run: git clone --depth 1 --branch v0.8.0 https://github.com/pgvector/pgvector.git C:\pgvector
+        run: git clone --depth 1 --branch v0.8.6 https://github.com/pgvector/pgvector.git C:\pgvector
       - name: Build
         shell: cmd
         run: |
