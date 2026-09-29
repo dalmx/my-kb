@@ -22,7 +22,7 @@ jobs:
           where cl
           where nmake
           if not exist C:\pg\pgsql\include\server\postgres.h (echo MISSING PG HEADERS & exit /b 1)
-          cd C:\pgvector
+          cd /d C:\pgvector
           nmake /F Makefile.win PGROOT=C:\pg\pgsql
           nmake /F Makefile.win PGROOT=C:\pg\pgsql install
       - name: Collect
