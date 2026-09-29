@@ -15,7 +15,7 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio2\Enterprise\VC\Auxiliary\Buildcvars64.bat"
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
           cd C:\pgvector
           nmake /F Makefile.win PGROOT=C:\pg\pgsql
           nmake /F Makefile.win PGROOT=C:\pg\pgsql install
@@ -23,7 +23,9 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force out\lib, out\ext | Out-Null
-          Copy-Item C:\pg\pgsql\libector.dll out\lib          Copy-Item C:\pg\pgsql\share\extensionector* out\ext          Compress-Archive -Path out -DestinationPath pgvector-pg18-win.zip
+          Copy-Item C:\pg\pgsql\lib\vector.dll out\lib\
+          Copy-Item C:\pg\pgsql\share\extension\vector* out\ext\
+          Compress-Archive -Path out -DestinationPath pgvector-pg18-win.zip
       - uses: actions/upload-artifact@v4
         with:
           name: pgvector-pg18-win
