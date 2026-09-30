@@ -16,9 +16,12 @@ import asyncio
 import re
 import json
 import datetime
-from mcp.server import Server
+from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import (
+    Tool, TextContent, PaginatedRequestParams, CallToolRequestParams,
+    ListToolsResult, CallToolResult,
+)
 
 from config import (
     KB_ROOT, DEFAULT_KB_ID, ALLOWED_KB_IDS, DEFAULT_SEARCH_KB_IDS,
@@ -50,7 +53,6 @@ server = Server("my-kb")
 # 工具定义（MCP 对外契约 — name/schema/description 不变）
 # ============================================================================
 
-@server.list_tools()
 async def list_tools():
     return [
         Tool(
@@ -411,11 +413,18 @@ async def list_tools():
     ]
 
 
+# ── mcp 2.x 显式注册（替代 1.x @server.list_tools() 装饰器；工具表内容零改动）──
+async def _on_list_tools(ctx, params):
+    return ListToolsResult(tools=await list_tools())
+
+
+server.add_request_handler("tools/list", PaginatedRequestParams, _on_list_tools)
+
+
 # ============================================================================
 # 工具路由（call_tool — 委托给各模块）
 # ============================================================================
 
-@server.call_tool()
 def _trash_file(kb_id, filename):
     """删除前移入回收站（2026-09-29 最小暴露加固）：移入 knowledge/{kb}/trash/ 带时间戳前缀；
     移动失败返回 False=调用方必须中止删除（fail-safe）。"""
@@ -1230,6 +1239,14 @@ async def call_tool(name: str, arguments: dict):
     except Exception as e:
         import traceback
         return [TextContent(type="text", text=f"错误: {e}\n{traceback.format_exc()}")]
+
+
+# ── mcp 2.x 显式注册（替代 1.x @server.call_tool() 装饰器；分发体内容零改动）──
+async def _on_call_tool(ctx, params):
+    return CallToolResult(content=await call_tool(params.name, params.arguments or {}))
+
+
+server.add_request_handler("tools/call", CallToolRequestParams, _on_call_tool)
 
 
 # ============================================================================
