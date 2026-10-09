@@ -149,6 +149,11 @@ def check_broken_links(kb_ids):
     返回格式化的断链报告文本。
     """
     all_files_map = all_kb_md_filenames()
+    # 引用语法示例占位符（kb-metadata-spec §九豁免）+ 仓库级配置文件 + 手册示例名
+    # （P2-C 2026-10-09：AGENTS/CLAUDE/README 是库外真实工程文件的合理引用；
+    #  x.md/a_x.md 是手册 20.x 回收站策略章节的示例文件名，非真引用）
+    placeholder_refs = {"wikilink.md", "xxx.md", "AGENTS.md", "CLAUDE.md",
+                        "README.md", "x.md", "a_x.md"}
 
     cross_ref = []      # 跨库引用（目标在其它知识库，正常）
     truly_missing = []  # 真缺失（所有库都找不到）
@@ -162,6 +167,8 @@ def check_broken_links(kb_ids):
                 continue
             refs = extract_all_references(content)
             for ref in refs:
+                if ref in placeholder_refs:
+                    continue
                 if ref in all_files_map:
                     target_kb = all_files_map[ref]
                     if target_kb != cur_kb:

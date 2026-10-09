@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 from config import (
-    MODEL_NAME, RERANKER_MODEL,
+    MODEL_NAME, RERANKER_MODEL, DEFAULT_KB_ID,
     DEFAULT_SEARCH_KB_IDS, ALLOWED_KB_IDS,
     _vectorstores, _embeddings, _reranker,
 )
@@ -371,7 +371,6 @@ def get_section_vectorstore(kb_id=None):
 
 def _get_store_object(kb_id, collection, create=False):
     """main/sections 两类 collection 访问对象的公共获取路径（缓存键带 collection）。"""
-    from config import DEFAULT_KB_ID
     target_kb = kb_id if kb_id is not None else DEFAULT_KB_ID
     validate_kb_id(target_kb)
     cache_key = target_kb if collection == "main" else f"{target_kb}::sections"

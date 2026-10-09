@@ -73,7 +73,7 @@ def run_benchmark(queries, n_results, label):
     reranker_active = retriever.get_reranker() is not None
     retriever_sha = hashlib.sha256((SCRIPT_DIR / "retriever.py").read_bytes()).hexdigest()[:8]
 
-    print(f"reranker: {'✅ 生效（分数=相关性概率）' if reranker_active else '❌ 降级（分数=距离）'} | retriever.py sha256[:8] = {retriever_sha}")
+    print(f"reranker: {'✅ 生效（分数=相关性概率）' if reranker_active else '❌ 降级（分数=相似度）'} | retriever.py sha256[:8] = {retriever_sha}")
     print(f"预热中（BM25 构建 + 首次模型调用，不计入统计）...")
     retriever.get_retriever().search("预热查询", n_results=1)
 

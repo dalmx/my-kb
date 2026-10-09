@@ -8,7 +8,7 @@
   models.py         模型管理（embeddings/reranker/vectorstore）
   preprocessing.py  文档预处理（frontmatter/分块/元数据）
   indexer.py        索引管理
-  retriever.py      检索引擎（三层重排）
+  retriever.py      检索引擎（四层检索 pipeline）
   graph_tools.py    文档图分析（断链/孤岛/引用）
 """
 
@@ -26,9 +26,10 @@ from mcp.types import (
 from config import (
     KB_ROOT, DEFAULT_KB_ID, ALLOWED_KB_IDS, DEFAULT_SEARCH_KB_IDS,
     MODEL_NAME, CHUNK_SIZE, CHUNK_OVERLAP, GAP_LOG_PATH, GAP_LOG_ENABLED,
+    TRASH_KEEP_VERSIONS, TRASH_MAX_AGE_DAYS,
     _async_tasks, _info_cache,
 )
-from utils import log, validate_kb_id, is_safe_filename, kb_markdown_dir
+from utils import log, validate_kb_id, is_safe_filename, kb_markdown_dir, file_lock
 from models import preload, get_vectorstore, get_reranker, WarmupBusyError
 from preprocessing import (
     parse_frontmatter, build_chunk_metadata, infer_title_from_h1, validate_doc_format,
@@ -58,7 +59,7 @@ async def list_tools():
         Tool(
             name="search_knowledge",
             description=(
-                "搜索知识库，返回相关内容。可按 kb_id/category/module/tags 过滤；不指定 kb_id 时默认检索 mes 库（当前为单库部署，见 config.py ALLOWED_KB_IDS）。三层重排（向量召回→规则加权→cross-encoder精排）。\n"
+                "搜索知识库，返回相关内容。可按 kb_id/category/module/tags 过滤；不指定 kb_id 时默认检索 mes 库（当前为单库部署，见 config.py ALLOWED_KB_IDS）。四层检索（向量+BM25 混合召回 RRF 融合→规则加权→cross-encoder 精排→MMR 同源去冗余）。\n"
                 "使用策略（Agentic RAG）：\n"
                 "1) 返回头部有【置信度】判定：✅高(top1≥0.5)直接采用；⚠️中(0.3~0.5)核对内容，必要时改写重试；❌低(<0.3)按其建议重试\n"
                 "2) 用户口语/模糊提问命中低/中置信时：把查询改写为 2-5 个变体（口语原句+专有名词+同义词）改用 search_knowledge_multi 重试\n"
@@ -426,25 +427,58 @@ server.add_request_handler("tools/list", PaginatedRequestParams, _on_list_tools)
 # ============================================================================
 
 def _trash_file(kb_id, filename):
-    """删除前移入回收站（2026-09-29 最小暴露加固）：移入 knowledge/{kb}/trash/ 带时间戳前缀；
-    移动失败返回 False=调用方必须中止删除（fail-safe）。"""
+    """删除/覆盖前把原文件移入回收站（knowledge/{kb}/raw/trash/，时间戳前缀）。
+
+    返回 (ok, info) 元组：ok=False 时调用方必须中止删除/覆盖（fail-safe），
+    info 为失败原因或回收落点路径；原文件不存在视为无需回收（ok=True, info=""）。
+    2026-10-09 P0 接线 + 修正旧 docstring 的"返回 False"错误契约（元组解包使用）。
+    """
     import shutil
     src = kb_markdown_dir(kb_id) / filename
     if not src.exists():
         return True, ""
     trash_dir = kb_markdown_dir(kb_id).parent / "trash"
-    trash_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    dst = trash_dir / ("%s_%s" % (ts, filename))
     try:
+        trash_dir.mkdir(parents=True, exist_ok=True)
+        # 微秒级时间戳：同秒多次覆盖也各占一版（shutil.move 撞名会静默 copy2 覆盖旧回收件）
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S%f")
+        dst = trash_dir / ("%s_%s" % (ts, filename))
         shutil.move(str(src), str(dst))
+        _trash_retention(trash_dir, filename)
         return True, str(dst)
     except Exception as e:
         return False, str(e)
 
 
+def _trash_retention(trash_dir, filename,
+                     keep=TRASH_KEEP_VERSIONS, max_age_days=TRASH_MAX_AGE_DAYS):
+    """回收站保留策略：同一原文件（<时间戳>_<filename> 精确匹配）最多留最近 keep 版，
+    超过 max_age_days 的旧件清理。清理失败静默——回收站整理不阻断主流程。
+
+    版本归属用 ^\\d{8}_\\d{6}\\d{0,6}_ 前缀 + 全名精确匹配（deepseek 审查④：朴素
+    "*_filename" glob 会把 a_x.md 的回收件误记为 x.md 的版本致误删）。"""
+    try:
+        import re as _re
+        import time as _t
+        pat = _re.compile(r"^\d{8}_\d{6}\d{0,6}_" + _re.escape(filename) + r"$")
+        entries = sorted((p for p in trash_dir.iterdir() if p.is_file() and pat.match(p.name)),
+                         key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
+        for p in entries[keep:]:
+            p.unlink(missing_ok=True)
+        cutoff = _t.time() - max_age_days * 86400
+        for p in trash_dir.iterdir():
+            try:
+                if p.is_file() and p.stat().st_mtime < cutoff:
+                    p.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
 def _audit(kb_id, tool, detail):
-    """写操作审计（2026-09-29）：追加 knowledge/{kb}/changelog.jsonl；失败不阻断主流程。"""
+    """写操作审计（2026-09-29）：追加 knowledge/{kb}/changelog.jsonl；失败不阻断主流程。
+    2026-09-30 追加自动 git commit：写库即入版本控制，防基线断档。"""
     try:
         rec = {"ts": datetime.datetime.now().isoformat(timespec="seconds"),
                "tool": tool, "kb": kb_id, "detail": detail}
@@ -453,15 +487,35 @@ def _audit(kb_id, tool, detail):
             fh.write(json.dumps(rec, ensure_ascii=False) + chr(10))
     except Exception:
         pass
+    _git_autocommit(detail)
+
+
+def _git_autocommit(detail):
+    """写操作后自动提交 git 基线（F:/rag）。
+    add 范围限 knowledge/（vectordb/log/lock 已被 .gitignore 排除）；
+    任何失败静默——多会话并发 commit 撞 index.lock 属预期，下次写库自然补上，
+    周五体检周报另有未提交提醒兜底。"""
+    try:
+        import subprocess
+        root = str(KB_ROOT.parent)
+        subprocess.run(["git", "add", "-A", "knowledge/"], cwd=root,
+                       timeout=30, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "kb-write: %s" % detail[:120], "--quiet"],
+                       cwd=root, timeout=30, capture_output=True)
+    except Exception:
+        pass
 
 
 async def call_tool(name: str, arguments: dict):
     try:
         # ── 检索 ──
         if name == "search_knowledge":
+            query = str(arguments.get("query") or "").strip()
+            if not query:
+                return [TextContent(type="text", text="错误: query 不能为空")]
             retriever = get_retriever()
             result_text, _ = retriever.search(
-                query=arguments.get("query", ""),
+                query=query,
                 n_results=arguments.get("n_results", 5),
                 kb_id=arguments.get("kb_id"),
                 category=arguments.get("category"),
@@ -477,6 +531,8 @@ async def call_tool(name: str, arguments: dict):
             queries = arguments.get("queries", [])
             if not queries or len(queries) < 2:
                 return [TextContent(type="text", text="错误: queries 至少需要 2 个查询变体")]
+            if len(queries) > 5:
+                return [TextContent(type="text", text="错误: queries 变体最多 5 个（描述契约 2-5 个），超出请合并同义变体")]
             result_text, _ = retriever.search_multi(
                 queries=queries,
                 n_results=arguments.get("n_results", 5),
@@ -587,8 +643,9 @@ async def call_tool(name: str, arguments: dict):
             if src:
                 entry["source"] = src
             try:
-                with open(GAP_LOG_PATH, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                with file_lock(GAP_LOG_PATH.with_suffix(".lock"), timeout=10):
+                    with open(GAP_LOG_PATH, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
                 log(f"误报报告已记录: {query[:80]}")
                 return [TextContent(
                     type="text",
@@ -697,8 +754,16 @@ async def call_tool(name: str, arguments: dict):
             save_dir = kb_markdown_dir(kb_id)
             save_dir.mkdir(parents=True, exist_ok=True)
             save_path = save_dir / filename
-            with open(save_path, "w", encoding="utf-8") as f:
-                f.write(content)
+            # 覆盖保护（P0 2026-10-09）：旧版先入回收站，失败则中止写入（原文件不动）
+            # P2：trash+写盘包进 KB 级 markdown 写锁，防并发写交错
+            with file_lock(save_dir.parent / "markdown_write.lock"):
+                if save_path.exists():
+                    ok_t, info_t = _trash_file(kb_id, filename)
+                    if not ok_t:
+                        return [TextContent(type="text", text=f"错误: 旧版移入回收站失败，已中止写入（原文件未动）: {info_t}")]
+                with open(save_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+            _audit(kb_id, "save_markdown", filename)
 
             meta_summary = f"category={category or '(读frontmatter)'} module={module or '(读frontmatter)'}"
             result = f"文件已保存: {save_path} | {meta_summary}"
@@ -728,7 +793,17 @@ async def call_tool(name: str, arguments: dict):
             if not source.endswith(".md"):
                 source = source + ".md"
 
+            # fail-safe 前置（P0 2026-10-09）：需删原文件时先移入回收站，失败则整个删除
+            # 中止（向量块与原文件均不动）；成功则文件已在回收站，后续仅清向量块
+            trash_dst = ""
+            if not keep_file:
+                with file_lock(kb_markdown_dir(kb_id).parent / "markdown_write.lock"):
+                    ok_t, trash_dst = _trash_file(kb_id, source)
+                    if not ok_t:
+                        return [TextContent(type="text", text=f"错误: 原文件移入回收站失败，已中止删除（向量块与原文件均未动）: {trash_dst}")]
+
             deleted_count = 0
+            vec_del_failed = False
             try:
                 # S7：where 精确拉取，免全量 get（本地/远程同构）
                 results = vectorstore.get(where={"source": source})
@@ -738,6 +813,7 @@ async def call_tool(name: str, arguments: dict):
                     deleted_count = len(ids_to_delete)
                     log(f"从向量库 {kb_id} 删除 {deleted_count} 个文档块")
             except Exception as e:
+                vec_del_failed = True
                 log(f"删除向量数据时出错: {e}")
 
             # 删向量块成功后失效 BM25 索引（bm25_manager 自述契约），
@@ -755,24 +831,18 @@ async def call_tool(name: str, arguments: dict):
                 except Exception:
                     pass
 
-            file_deleted = False
-            if not keep_file:
-                raw_path = KB_ROOT / kb_id / "raw" / "markdown" / source
-                if raw_path.exists():
-                    try:
-                        raw_path.unlink()
-                        file_deleted = True
-                    except Exception as e:
-                        log(f"删除原始文件时出错: {e}")
-
+            file_deleted = bool(trash_dst)
             if deleted_count > 0 or file_deleted:
+                _audit(kb_id, "delete_source", source + (" (keep_file)" if keep_file else ""))
                 msg = f"删除成功 (库 {kb_id}):\n"
                 if deleted_count > 0:
                     msg += f"- 从向量库删除 {deleted_count} 个文档块\n"
                 if file_deleted:
-                    msg += f"- 删除原始文件: {source}"
+                    msg += f"- 原文件已入回收站: {trash_dst}"
                 if keep_file and not file_deleted:
                     msg += f"- 原始文件已保留（keep_file=True）"
+                if vec_del_failed:
+                    msg += "\n⚠️ 向量块清理失败（原文件已入回收站；残留脏块可在下次 index_all_files(force=True) 时由 purge_orphan_sources 清理）"
                 return [TextContent(type="text", text=msg)]
             else:
                 return [TextContent(type="text", text=f"未找到来源文件: {source}")]
@@ -801,6 +871,7 @@ async def call_tool(name: str, arguments: dict):
                         msg += "".join(f"\n- {e}" for e in errors)
                 except Exception as e:
                     log(f"index_file 格式告警检查失败 {probe_name}: {e}")
+            _audit(kb_id, "index_file", filename)
             return [TextContent(type="text", text=msg)]
 
         # ── 批量索引 ──
@@ -811,6 +882,8 @@ async def call_tool(name: str, arguments: dict):
                 module=arguments.get("module"),
                 force=arguments.get("force", False),
             )
+            _audit(arguments.get("kb_id", DEFAULT_KB_ID), "index_all_files",
+                   "%s %d force=%s" % (mode_label, indexed_count, arguments.get("force", False)))
             result = f"索引完成:\n- {mode_label}文件数: {indexed_count}\n- 失败: {len(failed)}"
             if failed:
                 result += "\n\n失败详情:\n" + "\n".join(f"- {f}" for f in failed)
@@ -822,6 +895,7 @@ async def call_tool(name: str, arguments: dict):
                 kb_id=arguments.get("kb_id", DEFAULT_KB_ID),
                 force=True,
             )
+            _audit(arguments.get("kb_id", DEFAULT_KB_ID), "reindex_all", "重建 %d" % indexed_count)
             result = f"重建完成:\n- {mode_label}文件数: {indexed_count}\n- 失败: {len(failed)}"
             if failed:
                 result += "\n\n失败详情:\n" + "\n".join(f"- {f}" for f in failed)
@@ -847,6 +921,7 @@ async def call_tool(name: str, arguments: dict):
                     _async_tasks.pop(task_key, None)
 
             _async_tasks[task_key] = asyncio.create_task(_do_rebuild())
+            _audit(kb_id, "rebuild_index_async", "force=%s" % force)
             return [TextContent(type="text", text=f"异步重建已启动（库 {kb_id}）。后台处理中，进度输出到 stderr 日志。")]
 
         # ── 重命名 ──
@@ -860,6 +935,8 @@ async def call_tool(name: str, arguments: dict):
 
             if not source or not new_name:
                 return [TextContent(type="text", text="错误: source 和 new_name 不能为空")]
+            if not is_safe_filename(source):
+                return [TextContent(type="text", text="错误: 源文件名包含非法字符")]
             if not is_safe_filename(new_name):
                 return [TextContent(type="text", text="错误: 新文件名包含非法字符")]
             # 与 get_source 行为对齐：少打 .md 后缀不报"不存在"
@@ -878,30 +955,31 @@ async def call_tool(name: str, arguments: dict):
             if new_path.exists() and old_path != new_path and not case_only_rename:
                 return [TextContent(type="text", text=f"错误: 目标文件已存在: {new_name}")]
 
-            if case_only_rename:
-                tmp_path = kb_markdown_dir(kb_id) / (new_name + ".tmp_rename")
-                old_path.rename(tmp_path)
-                tmp_path.rename(new_path)
-            else:
-                old_path.rename(new_path)
-            log(f"重命名: {source} → {new_name}")
-
+            # P2：rename + 引用批量改写包进 markdown 写锁（update_references 自身不加锁，靠调用方持有）
             ref_changed = 0
-            if update_refs:
-                ref_changed = update_references(kb_id, source, new_name)
+            with file_lock(kb_markdown_dir(kb_id).parent / "markdown_write.lock"):
+                if case_only_rename:
+                    tmp_path = kb_markdown_dir(kb_id) / (new_name + ".tmp_rename")
+                    old_path.rename(tmp_path)
+                    tmp_path.rename(new_path)
+                else:
+                    old_path.rename(new_path)
+                log(f"重命名: {source} → {new_name}")
+
+                if update_refs:
+                    ref_changed = update_references(kb_id, source, new_name)
 
             index_msg = ""
             if reindex_flag:
-                # 删旧索引
+                # 删旧索引（P1-3：where 精确拉取免全量 get；失败必 log，不再静默）
                 try:
                     vs = get_vectorstore(kb_id)
-                    results = vs.get()
-                    old_ids = [results["ids"][i] for i, m in enumerate(results.get("metadatas", []))
-                               if m and m.get("source") == source]
+                    results = vs.get(where={"source": source})
+                    old_ids = list(results.get("ids", []))
                     if old_ids:
                         vs.delete(ids=old_ids)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log(f"move_source 删旧索引失败 {source}（旧名残留可经 index_all_files(force=True) 清理）: {e}")
                 # P1（CC 审查 20260908）：旧名 sections 同步清理（新名由 _index_file 挂钩重建；门控）
                 try:
                     from section_index import delete_source_sections
@@ -910,6 +988,7 @@ async def call_tool(name: str, arguments: dict):
                     pass
                 success, index_msg = _index_file(filename=new_name, kb_id=kb_id)
 
+            _audit(kb_id, "move_source", f"{source} -> {new_name}")
             msg = f"重命名成功（库 {kb_id}）:\n- {source} → {new_name}"
             if update_refs:
                 msg += f"\n- 更新引用: {ref_changed} 个文件"
@@ -956,13 +1035,27 @@ async def call_tool(name: str, arguments: dict):
                         if fix and "title" in missing:
                             title = infer_title_from_h1(body, md_file.name)
                             if title and title != md_file.name:
-                                if content.startswith("---"):
-                                    new_content = "---\ntitle: " + title + "\n" + content[3:]
-                                else:
-                                    new_content = f"---\ntitle: {title}\n---\n\n{content}"
-                                with open(md_file, "w", encoding="utf-8") as f:
-                                    f.write(new_content)
+                                # F2（P2 r2）：RMW 包 markdown 写锁，锁内重读复核防 TOCTOU
+                                with file_lock(md_file.parent.parent / "markdown_write.lock"):
+                                    content_now = md_file.read_text(encoding="utf-8")
+                                    fm_now, _ = parse_frontmatter(content_now)
+                                    if fm_now.get("title"):
+                                        continue  # 并发方已补，跳过
+                                    if content_now.startswith("---"):
+                                        new_content = "---\ntitle: " + title + "\n" + content_now[3:]
+                                    else:
+                                        new_content = f"---\ntitle: {title}\n---\n\n{content_now}"
+                                    with open(md_file, "w", encoding="utf-8") as f:
+                                        f.write(new_content)
                                 fixed.append((cur_kb, md_file.name, title))
+                                _audit(cur_kb, "validate_frontmatter_fix", md_file.name)
+                                # P1-3：fix 改盘后立即重索引，防向量库 title 元数据陈旧
+                                try:
+                                    ok_ix, msg_ix = _index_file(filename=md_file.name, kb_id=cur_kb)
+                                    if not ok_ix:
+                                        log(f"validate_frontmatter fix 后重索引未成功 {md_file.name}: {msg_ix}")
+                                except Exception as e:
+                                    log(f"validate_frontmatter fix 后重索引失败 {md_file.name}: {e}")
 
             total_files = sum(len(scan_md_files(k)) for k in target_kbs)
             lines = [f"Frontmatter 校验报告 (检查 {total_files} 个文件):"]
@@ -1042,6 +1135,10 @@ async def call_tool(name: str, arguments: dict):
                 return [TextContent(type="text", text="错误: sources 和 target 不能为空")]
             if not is_safe_filename(target):
                 return [TextContent(type="text", text="错误: 目标文件名包含非法字符")]
+            # P0 2026-10-09：sources 逐项路径安全校验（此前仅 target 校验，越界可删库外文件）
+            bad_src = next((s for s in sources if not is_safe_filename(s)), None)
+            if bad_src is not None:
+                return [TextContent(type="text", text=f"错误: sources 含非法文件名: {bad_src}")]
             if not target.endswith(".md"):
                 target = target + ".md"
 
@@ -1085,41 +1182,56 @@ async def call_tool(name: str, arguments: dict):
             # 合并结果先过格式校验（与 save_markdown 同一门槛），不通过则中止：
             # target 未写入、sources 未删除
             ok, errors = validate_doc_format(final_content)
-            if not ok:
+            dup_errors = [e for e in errors if "序号重复" in e]
+            hard_errors = [e for e in errors if "序号重复" not in e]
+            if hard_errors:
                 err_msg = ("合并内容格式校验未通过，已中止合并（target 未写入、sources 未删除）。"
                            "请改用 content 参数提供修正后的完整内容。问题：\n")
-                err_msg += "\n".join(f"  - {e}" for e in errors)
+                err_msg += "\n".join(f"  - {e}" for e in hard_errors)
                 return [TextContent(type="text", text=err_msg)]
+            # F1（P2 r2）：机械拼接同号章节导致的重号不中止合并（常见操作），
+            # 成功消息附告警提示后续整理
 
-            # 先写 target 成功，再删 sources（此前先删后写，中途失败即丢源文件）
+            # 两阶段（P0 r2 修订，deepseek 审查③）：先回收站化（target 旧版 + 全部旧源），
+            # 任一失败即中止——此时 target 未写入、引用未改，已回收的源在回收站可复原；
+            # 全部成功后才写 target、改引用、清向量块、重建索引
             md_dir.mkdir(parents=True, exist_ok=True)
-            with open(target_path, "w", encoding="utf-8") as f:
-                f.write(final_content)
+            # P2：两阶段 trash + 写 target + 引用更新全程持 markdown 写锁
+            with file_lock(md_dir.parent / "markdown_write.lock"):
+                if target_path.exists():
+                    ok_t, info_t = _trash_file(kb_id, target)
+                    if not ok_t:
+                        return [TextContent(type="text", text=f"错误: 目标旧版 {target} 移入回收站失败，已中止合并（未做任何更改）: {info_t}")]
+                trashed_sources = []
+                for src in sources:
+                    if not src.endswith(".md"):
+                        src = src + ".md"
+                    src_path = md_dir / src
+                    if src_path.exists() and src_path != target_path:
+                        ok_t, info_t = _trash_file(kb_id, src)
+                        if not ok_t:
+                            return [TextContent(type="text", text=f"错误: 源文件 {src} 移入回收站失败，已中止合并（target 未写入、引用未改，已回收的源可从回收站复原）: {info_t}")]
+                        trashed_sources.append(src)
 
-            ref_changed = 0
-            for src in sources:
-                ref_changed += update_references(kb_id, src, target)
+                with open(target_path, "w", encoding="utf-8") as f:
+                    f.write(final_content)
+
+                ref_changed = 0
+                for src in sources:
+                    ref_changed += update_references(kb_id, src, target)
 
             vs = get_vectorstore(kb_id)
-            deleted_files = 0
+            deleted_files = len(trashed_sources)
             for src in sources:
                 if not src.endswith(".md"):
                     src = src + ".md"
-                src_path = md_dir / src
-                if src_path.exists() and src_path != target_path:
-                    try:
-                        src_path.unlink()
-                        deleted_files += 1
-                    except Exception as e:
-                        log(f"删除旧文件失败 {src}: {e}")
                 try:
-                    results = vs.get()
-                    old_ids = [results["ids"][i] for i, m in enumerate(results.get("metadatas", []))
-                               if m and m.get("source") == src]
+                    results = vs.get(where={"source": src})
+                    old_ids = list(results.get("ids", []))
                     if old_ids:
                         vs.delete(ids=old_ids)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log(f"merge_sources 删旧索引失败 {src}（残留可经 index_all_files(force=True) 清理）: {e}")
                 # P1（CC 审查 20260908）：旧 source 的 sections 粗索引同步清理（门控）
                 try:
                     from section_index import delete_source_sections
@@ -1135,7 +1247,10 @@ async def call_tool(name: str, arguments: dict):
                 pass
 
             success, index_msg = _index_file(filename=target, kb_id=kb_id)
+            _audit(kb_id, "merge_sources", f"{len(sources)}源 -> {target}")
             msg = f"合并成功（库 {kb_id}）:\n- 合并 {len(sources)} 个文件 → {target}\n- 删除旧文件: {deleted_files}\n- 更新引用: {ref_changed} 处\n- 格式校验: 通过\n- {index_msg}"
+            if dup_errors:
+                msg += "\n⚠️ " + "；".join(dup_errors) + "（机械拼接所致，建议后续整理顺延编号）"
             return [TextContent(type="text", text=msg)]
 
         # ── 读取全文 ──
@@ -1170,54 +1285,71 @@ async def call_tool(name: str, arguments: dict):
 
             if not filename:
                 return [TextContent(type="text", text="错误: 文件名不能为空")]
+            if not is_safe_filename(filename):
+                return [TextContent(type="text", text="错误: 文件名包含非法字符")]
             file_path = kb_markdown_dir(kb_id) / filename
             if not file_path.exists():
                 return [TextContent(type="text", text=f"错误: 文件不存在: {filename}")]
 
-            with open(file_path, "r", encoding="utf-8") as f:
-                original = f.read()
+            # P2：读-改-写全程持 markdown 写锁，防并发追加互相覆盖丢更新
+            # （手动持锁而非 with 包裹：块体免整体重缩进；try/finally 保证释放）
+            _mdlock = file_lock(kb_markdown_dir(kb_id).parent / "markdown_write.lock")
+            _mdlock.__enter__()
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    original = f.read()
 
-            # 用 python-frontmatter 剥离 frontmatter（稳健）
-            fm, body = parse_frontmatter(original)
+                # 用 python-frontmatter 剥离 frontmatter（稳健）
+                fm, body = parse_frontmatter(original)
 
-            # 可选更新 frontmatter 字段
-            fm_changed = False
-            if category is not None:
-                fm["category"] = category
-                fm_changed = True
-            if module is not None:
-                fm["module"] = module
-                fm_changed = True
-            if tags is not None:
-                fm["tags"] = tags
-                fm_changed = True
+                # F5（P2 r2）：追加内容自身的序号不得与既有章节重号
+                # （for_append 豁免的是存量债；新引入的重号在此精准拦截）
+                from preprocessing import h2_section_numbers
+                _clash = set(h2_section_numbers(body)) & set(h2_section_numbers(content))
+                if _clash:
+                    return [TextContent(type="text", text=f"错误: 追加内容章节序号与既有章节重复: {', '.join(sorted(_clash))}（请顺延编号）")]
 
-            # 内容有变更，刷新 updated 为今天（最后确认有效日期）
-            fm["updated"] = datetime.date.today().isoformat()
+                # 可选更新 frontmatter 字段
+                fm_changed = False
+                if category is not None:
+                    fm["category"] = category
+                    fm_changed = True
+                if module is not None:
+                    fm["module"] = module
+                    fm_changed = True
+                if tags is not None:
+                    fm["tags"] = tags
+                    fm_changed = True
 
-            # 构造新内容
-            import frontmatter as fm_lib
-            post = fm_lib.Post(body, **fm)
-            new_body = post.content
-            if separator:
-                new_body = new_body.rstrip() + "\n\n" + separator + "\n\n" + content
-            else:
-                new_body = new_body.rstrip() + "\n\n" + content
+                # 内容有变更，刷新 updated 为今天（最后确认有效日期）
+                fm["updated"] = datetime.date.today().isoformat()
 
-            # 写回（先序列化成字符串，成功后再写文件，防止异常清空原文件）
-            post = fm_lib.Post(new_body, **fm)
-            output = fm_lib.dumps(post)
+                # 构造新内容
+                import frontmatter as fm_lib
+                post = fm_lib.Post(body, **fm)
+                new_body = post.content
+                if separator:
+                    new_body = new_body.rstrip() + "\n\n" + separator + "\n\n" + content
+                else:
+                    new_body = new_body.rstrip() + "\n\n" + content
 
-            # 格式校验：for_append=True 豁免存量债（H1==title / H1 后摘要），
-            # 追加内容自身的中文序号与围栏语言照常拦
-            ok, errors = validate_doc_format(output, for_append=True)
-            if not ok:
-                err_msg = f"追加后文档格式校验未通过，已拒绝写回（原文件未改动）。请修正：\n"
-                err_msg += "\n".join(f"  - {e}" for e in errors)
-                return [TextContent(type="text", text=err_msg)]
+                # 写回（先序列化成字符串，成功后再写文件，防止异常清空原文件）
+                post = fm_lib.Post(new_body, **fm)
+                output = fm_lib.dumps(post)
 
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(output)
+                # 格式校验：for_append=True 豁免存量债（H1==title / H1 后摘要），
+                # 追加内容自身的中文序号与围栏语言照常拦
+                ok, errors = validate_doc_format(output, for_append=True)
+                if not ok:
+                    err_msg = f"追加后文档格式校验未通过，已拒绝写回（原文件未改动）。请修正：\n"
+                    err_msg += "\n".join(f"  - {e}" for e in errors)
+                    return [TextContent(type="text", text=err_msg)]
+
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(output)
+            finally:
+                _mdlock.__exit__(None, None, None)
+            # F6（P2 r2）：审计（含 git 子进程）挪锁外，缩短持锁时长（与 save/move/merge 口径一致）
             _audit(kb_id, "append_section", "%s +%d chars" % (filename, len(content)))
 
             index_msg = ""

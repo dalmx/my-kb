@@ -282,6 +282,16 @@ def build_where_filter(category=None, module=None, tags=None, source=None, facto
     return conditions or None
 
 
+def h2_section_numbers(body):
+    """提取正文 h2 章节的中文序号列表（供追加重号检测；口径与校验 8b 一致）。"""
+    nums = []
+    for _ln, t in _scan_body_structure(body)["h2_sections"]:
+        m = re.match(r"^([一二三四五六七八九十百零两]+)[、.．:：\s]", t or "")
+        if m:
+            nums.append(m.group(1))
+    return nums
+
+
 # ============ 内容工具（frontmatter 区段 / 合并拼接） ============
 
 # 首个 --- 对（frontmatter 区段）：起始行 ---，到下一行首 --- 为止
@@ -513,6 +523,20 @@ def validate_doc_format(content, for_append=False):
             errors.append(
                 f"`## ` 章节标题须用中文序号（## 一、## 二、…，首字符为中文数字）。"
                 f"违规: {shown}{more}"
+            )
+
+    # 8b. 章节序号重复（W19：两个"## 八、"式重号曾实际发生且校验放行）；
+    # for_append 豁免存量债（追加不应被历史重号卡死，与 6/7 条同理）
+    if not for_append and struct["h2_sections"]:
+        h2_nums = []
+        for _ln, t in struct["h2_sections"]:
+            m = re.match(r"^([一二三四五六七八九十百零两]+)[、.．:：\s]", t or "")
+            if m:
+                h2_nums.append(m.group(1))
+        dup_nums = sorted({n for n in h2_nums if h2_nums.count(n) > 1})
+        if dup_nums:
+            errors.append(
+                f"`## ` 章节序号重复: {', '.join(dup_nums)}（存在多个同序号章节，请顺延编号后重排）"
             )
 
     # 9. 代码开栏围栏标注语言（状态机只查开栏，闭合行裸 ``` 属正常）

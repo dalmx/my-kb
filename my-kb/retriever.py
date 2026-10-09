@@ -14,7 +14,7 @@ from models import get_vectorstore, get_reranker, get_embeddings, vector_mode, w
 from service_client import bm25_query
 from preprocessing import build_where_filter
 from hit_stats import record_hits
-from utils import log, validate_kb_id
+from utils import log, validate_kb_id, file_lock
 import datetime
 import json
 import time
@@ -24,7 +24,7 @@ _gap_logged = {}
 
 
 class KnowledgeRetriever:
-    """三层检索 pipeline，可降级。"""
+    """四层检索 pipeline（混合召回→规则重排→cross-encoder 精排→MMR），可降级。"""
 
     def __init__(self):
         # sections 粗索引寻址信号：本轮检索命中的 (source, h2) 章节键集合，
@@ -36,11 +36,11 @@ class KnowledgeRetriever:
         self._section_keys = set()
 
     def search(self, query, n_results=5, kb_id=None, category=None, module=None, tags=None, factory=None):
-        """执行三层检索，返回 (results_text, top_hits)。
+        """执行四层检索，返回 (results_text, top_hits)。
 
-        top_hits = [(score, doc, kb_id)]
+        top_hits = [(score, doc, kb_id)]（search_multi 为 4 元组，末位=最佳召回查询下标）
           - 用 reranker 时 score = 相关性概率（越高越相关）
-          - 降级时 score = 规则调整后距离（越小越相似）
+          - 降级时 score = 规则调整后相似度（越高越相关；纯向量路径为负距离）——P1-1 方向统一
         """
         if warmup_busy():
             raise WarmupBusyError(
@@ -71,16 +71,16 @@ class KnowledgeRetriever:
         # 4. 第二层：cross-encoder 精排
         # rerank_pool 元素统一为 (display_score, doc, kb_id)
         #   - 用 reranker 时 display_score = 相关性概率（越高越相关）
-        #   - 降级时 display_score = 规则调整后距离（越小越相似）
+        #   - 降级时 display_score = 规则调整后相似度（越高越相关；P1-1 方向统一，负距离不再是"越小越好"）
         rerank_pool = rule_ranked[:RERANK_POOL_K]
         reranker = get_reranker()
         if reranker is not None and len(rerank_pool) > 1:
             try:
-                pairs = [(query, doc.page_content[:1000]) for _, doc, _ in rerank_pool]
+                pairs = [(query, doc.page_content[:1500]) for _, doc, _ in rerank_pool]
                 scores = reranker.predict(pairs)
                 scored = list(zip(scores, rerank_pool))
                 scored.sort(key=lambda x: -x[0])
-                # 把 reranker 分数带进排序后的候选（替代规则距离）
+                # 把 reranker 分数带进排序后的候选（替代规则加权相似度）
                 ranked = [(float(rscore), doc, cur_kb) for rscore, (_, doc, cur_kb) in scored]
                 used_reranker = True
             except Exception as e:
@@ -234,22 +234,24 @@ class KnowledgeRetriever:
             h1 = (doc.metadata.get("h1", "") or "").lower()
             h2 = (doc.metadata.get("h2", "") or "").lower()
             tag_s = (doc.metadata.get("tags", "") or "").lower()
-            # 固定减分（标题最强，逐层递减）
-            score -= sum(1 for w in all_words if w in title) * 0.15
-            score -= sum(1 for w in all_words if w in h1) * 0.12
-            score -= sum(1 for w in all_words if w in h2) * 0.10
-            score -= sum(1 for w in all_words if w in tag_s) * 0.08
+            # 固定加分（标题最强，逐层递减）——P1-1 方向统一：基础分为相似度语义，加分后降序
+            score += sum(1 for w in all_words if w in title) * 0.15
+            score += sum(1 for w in all_words if w in h1) * 0.12
+            score += sum(1 for w in all_words if w in h2) * 0.10
+            score += sum(1 for w in all_words if w in tag_s) * 0.08
             # STAIR 实验（2026-09-08，均 flag 门控默认关）：
             # h3 元数据加权 + sections 章节寻址加成
             if RULE_H3_ENABLED:
                 h3 = (doc.metadata.get("h3", "") or "").lower()
-                score -= sum(1 for w in all_words if w in h3) * RULE_H3_WEIGHT
+                score += sum(1 for w in all_words if w in h3) * RULE_H3_WEIGHT
             if self._section_keys and (doc.metadata.get("source", ""),
                                        doc.metadata.get("h2", "")) in self._section_keys:
-                score -= SECTION_BOOST
+                score += SECTION_BOOST
             return score
 
-        return sorted(fused, key=_rescore)
+        # P1-1：输出元组携带加权分（排序键与展示分数一致；reranker 生效时会被概率覆盖）
+        ranked = sorted(fused, key=_rescore, reverse=True)
+        return [(_rescore(item), item[1], item[2], item[3]) for item in ranked]
 
     def _rerank_multi(self, queries, rerank_pool, reranker):
         """reranker 精排（多查询版）：每个 doc 用召回它的最佳 query 配对打分。
@@ -264,7 +266,7 @@ class KnowledgeRetriever:
         pairs = []
         for _, doc, _, best_q_idx in rerank_pool:
             q = queries[best_q_idx] if best_q_idx < len(queries) else queries[0]
-            pairs.append((q, doc.page_content[:1000]))
+            pairs.append((q, doc.page_content[:1500]))
 
         scores = reranker.predict(pairs)
         scored = list(zip(scores, rerank_pool))
@@ -348,8 +350,11 @@ class KnowledgeRetriever:
             log(f"[sections] 章节索引查询失败（跳过加成）: {e}")
 
     def _vector_recall(self, query, target_kbs, n_results, where):
-        """纯向量召回（降级路径）。返回 [(distance, doc, kb_id)]。
+        """纯向量召回（降级路径）。返回 [(similarity, doc, kb_id)]。
 
+        similarity = -distance（负距离，越大越相关）——2026-10-09 P1-1 方向统一：
+        全链分数统一为"越大越好"的相似度语义，与 RRF 通道一致，下游规则重排/
+        跨查询融合不再需要区分通道语义（此前按距离语义处理，方向倒置）。
         查询向量只算一次、三库共用（原先每库各 embed 一遍同一 query，
         白付 2/3 的 embed HTTP + 推理锁开销；benchmark diff 验证结果逐位一致）。
         """
@@ -362,7 +367,7 @@ class KnowledgeRetriever:
             vs = get_vectorstore(cur_kb)
             hits = self._search_by_vector(vs, emb, pool_k, where)
             for doc, score in hits:
-                all_hits.append((score, doc, cur_kb))
+                all_hits.append((-score, doc, cur_kb))
         self._query_section_keys(emb, target_kbs, where)
         return all_hits
 
@@ -418,22 +423,25 @@ class KnowledgeRetriever:
                     self._note_recall_failure(f"向量召回失败({cur_kb}): {e}")
                     log(f"[混合检索] 向量召回失败({cur_kb}): {e}")
 
-            # BM25 召回
+            # BM25 召回（P2：先超采 3 倍再过滤——BM25 不支持 where，先截后滤在
+            # 严格过滤下会把有效候选滤到所剩无几；过滤后截回 bm25_k）
             try:
                 if vector_mode() == "remote":
                     # 远程模式：BM25 索引常驻共享服务（写后自动失效），直接召回。
                     # BM25 端点 503（空库/构建失败）是通道级故障，不触发远程模式回收
-                    bm25_hits = bm25_query(cur_kb, query, bm25_k)
+                    bm25_hits = bm25_query(cur_kb, query, bm25_k * 3)
                     bm25_ranked = [(i, doc) for i, doc in enumerate(bm25_hits)]
                 else:
                     bm25 = self._get_bm25(cur_kb)
                     if bm25 is not None:
                         # BM25Retriever 不支持 where 过滤，召回后在内存过滤
-                        bm25_hits = bm25.invoke(query)[:bm25_k]
+                        bm25_hits = bm25.invoke(query)[:bm25_k * 3]
                         # BM25 已按相关性降序排好 → rank 0 是最佳
                         bm25_ranked = [(i, doc) for i, doc in enumerate(bm25_hits)]
                 if where and bm25_ranked:
-                    bm25_ranked = self._apply_meta_filter(bm25_ranked, where)
+                    bm25_ranked = self._apply_meta_filter(bm25_ranked, where)[:bm25_k]
+                elif bm25_ranked:
+                    bm25_ranked = bm25_ranked[:bm25_k]
             except Exception as e:
                 self._note_recall_failure(f"BM25 召回失败({cur_kb}): {e}")
                 log(f"[混合检索] BM25 召回失败({cur_kb}): {e}")
@@ -527,7 +535,7 @@ class KnowledgeRetriever:
         return True
 
     def _rule_rerank(self, query, hits):
-        """规则重排：标题/标签/h1/h2 命中关键词加权（固定减分）。"""
+        """规则重排：标题/标签/h1/h2 命中关键词加权（固定加分，P1-1 方向统一）。"""
         query_lower = query.lower()
         # 中文用 jieba 分词（否则 "GridPanel行底色" 会被当成一个 token，
         # 永远匹配不到 title/h1 里的词）；混合英文也能正确切分
@@ -549,23 +557,26 @@ class KnowledgeRetriever:
             tag_hits = sum(1 for w in query_words if w in tag_s)
             h1_hits = sum(1 for w in query_words if w in h1)
             h2_hits = sum(1 for w in query_words if w in h2)
-            # 固定减分（标题最强，h1次之，标签/h2 再次）
+            # 固定加分（标题最强，h1次之，标签/h2 再次）——P1-1 方向统一：
+            # 基础分（RRF/负距离）已是"越大越相关"，命中加分后降序排即提前
             adj = score
-            adj -= title_hits * 0.15
-            adj -= h1_hits * 0.12
-            adj -= h2_hits * 0.10
-            adj -= tag_hits * 0.08
+            adj += title_hits * 0.15
+            adj += h1_hits * 0.12
+            adj += h2_hits * 0.10
+            adj += tag_hits * 0.08
             # STAIR 实验（2026-09-08，均 flag 门控默认关）：
             # h3 元数据加权 + sections 章节寻址加成
             if RULE_H3_ENABLED:
                 h3 = (doc.metadata.get("h3", "") or "").lower()
-                adj -= sum(1 for w in query_words if w in h3) * RULE_H3_WEIGHT
+                adj += sum(1 for w in query_words if w in h3) * RULE_H3_WEIGHT
             if self._section_keys and (doc.metadata.get("source", ""),
                                        doc.metadata.get("h2", "")) in self._section_keys:
-                adj -= SECTION_BOOST
+                adj += SECTION_BOOST
             return adj
 
-        return sorted(hits, key=_rescore)
+        # P1-1：输出元组携带加权分（排序键与展示分数一致；reranker 生效时会被概率覆盖）
+        ranked = sorted(hits, key=_rescore, reverse=True)
+        return [(_rescore(item), item[1], item[2]) for item in ranked]
 
     def _format_results(self, top, used_reranker, queries=None):
         """格式化检索结果为文本。兼容 3 元组（单查询）和 4 元组（多查询）。
@@ -605,8 +616,8 @@ class KnowledgeRetriever:
             if updated:
                 meta_line += f" | 更新: {updated}"
 
-            # reranker 分数越高越相关；向量距离越小越相似
-            score_label = "相关性" if used_reranker else "相似度距离"
+            # 全链相似度语义（P1-1 统一）：分数越大越相关（reranker 概率 / 规则调整后相似度）
+            score_label = "相关性" if used_reranker else "相似度"
             header = f"--- 结果 {i} ({score_label} {score:.4f}){self._lifecycle_flag(doc)} ---"
             output.append(f"{header}\n{meta_line}\n内容:\n{doc.page_content}\n")
 
@@ -615,12 +626,12 @@ class KnowledgeRetriever:
     def _confidence_header(self, top1_score, used_reranker, queries):
         """检索反馈信号：置信度判定 + 低置信时的重试建议。
 
-        阈值仅对 reranker 相关性概率有效；降级模式（距离分数）不判定。
+        阈值仅对 reranker 相关性概率有效；降级模式（相似度分数）不判定。
         单查询与多查询的低置信建议不同：单查询建议改写后换 multi 重试，
         多查询建议检查变体质量/放宽过滤。
         """
         if not used_reranker:
-            return "【置信度】—（reranker 不可用已降级，分数为距离，无置信度判定）"
+            return "【置信度】—（reranker 不可用已降级，分数为规则调整后相似度，无置信度判定）"
         n_q = len([q for q in (queries or []) if q and q.strip()])
         is_single = n_q <= 1
         if top1_score >= CONFIDENCE_HIGH:
@@ -687,8 +698,11 @@ class KnowledgeRetriever:
                 "top1": round(float(top1_score), 4),
                 "filters": {k: v for k, v in (filters or {}).items() if v},
             }
-            with open(GAP_LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            # P2：跨进程文件锁（hit_stats 同款哲学）；去重表仍为进程内——
+            # 多会话并发时会重复记录，低频且无害，文档化即可
+            with file_lock(GAP_LOG_PATH.with_suffix(".lock"), timeout=10):
+                with open(GAP_LOG_PATH, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception as e:
             log(f"缺口日志写入失败（忽略）: {e}")
 

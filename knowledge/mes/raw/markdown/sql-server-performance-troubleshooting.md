@@ -501,11 +501,11 @@ WITH (FILLFACTOR = 90, ONLINE = ON);   -- Standard 版去掉 ONLINE，选低峰�
 
 ---
 
-## 八、实战案例：计划执行日期范围改造的索引与类型判定（2026-09-03）
+## 九、实战案例：计划执行日期范围改造的索引与类型判定（2026-09-03）
 
 > 成型「计划执行」页（MoldingPlanExecute）查询从单日改日期范围时，对存储过程 `PROC_BPM_SELECT_EXECUTE_PLAN` 做 expert-sql 审查 + 用户连库核实索引/列类型的完整判定实录。已上线验证通过。改造套路见 `extnet-query-control-upgrade.md` 第八/九章，本节沉淀**SQL 侧判定经验**。
 
-### 8.1 sp_helpindex 看不到 INCLUDE 列——判覆盖索引必须用 sys.index_columns
+### 9.1 sp_helpindex 看不到 INCLUDE 列——判覆盖索引必须用 sys.index_columns
 
 `sp_helpindex` 第三列只显示**键列**，INCLUDE 列完全不显示。本例两个同以 PLAN_DATE 打头的索引：`INDEX_PLAN_INFO(PLAN_DATE,SHIFT_CODE,EQUIP_CODE)` 键列三枚无 INCLUDE；`IX_BPM_MOLDING_PLAN_DATE(PLAN_DATE)` 表面像被前者前缀覆盖（冗余），sys.index_columns 一查实为 **INCLUDE(PLAN_ID,EQUIP_CODE,SHIFT_CODE,REMARK) 的覆盖索引**——是范围查询的零回表驱动索引，必须保留。**判冗余前先查 INCLUDE，否则误删覆盖索引**：
 
@@ -518,29 +518,29 @@ WHERE i.object_id=OBJECT_ID('dbo.表名') AND i.name IN ('索引A','索引B')
 ORDER BY i.name, ic.is_included_column;
 ```
 
-### 8.2 冗余索引的三种判定模式（本例实证）
+### 9.2 冗余索引的三种判定模式（本例实证）
 
 | 模式 | 本例 | 处置 |
 |------|------|------|
 | 同列纯重复 | `INDEX_PIANID(PLAN_ID)` 与新建分区对齐 `IX_..._PLANID(PLAN_ID)` | 删旧的（留分区对齐 PS_* 上的） |
 | 与唯一主键完全重复 | `IX_BPM_PRODUCTION_GREEN_TYRE_NO` 而 GREEN_TYRE_NO 本身就是非聚集唯一主键 | 删（等值 Seek 走主键索引即可） |
-| 前缀覆盖假象 | 见 8.1——键列被覆盖但带 INCLUDE | **不删**，覆盖索引与复合键索引职责不同 |
+| 前缀覆盖假象 | 见 9.1——键列被覆盖但带 INCLUDE | **不删**，覆盖索引与复合键索引职责不同 |
 
 **覆盖索引 vs 复合键索引不互冗余**：INCLUDE 列只能"陪读"（消除回表），不能参与 Seek；SHIFT_CODE/EQUIP_CODE 放键列（三列等值精确 Seek）与放 INCLUDE（日期范围内叶级过滤）服务不同访问模式，两者共存是常态。
 
-### 8.3 varchar 存 yyyy-MM-dd 的日期列：范围比较安全
+### 9.3 varchar 存 yyyy-MM-dd 的日期列：范围比较安全
 
 `BPM_MOLDING_PLAN.PLAN_DATE` 是 `varchar(10)` 存 `yyyy-MM-dd`——ISO 格式字符串**字典序=时间序**，`>= 开始 AND <= 结束` 结果正确、列上无函数、SARGable 可走索引范围 Seek。此类列做日期范围改造**不需要 CAST 成 date**（CAST 反而破坏 SARGable）；前提是存量数据格式严格统一（既有单日等值查询正常即是佐证）。
 
-### 8.4 bigint=bigint 的 join 去掉 convert 恢复 SARGable
+### 9.4 bigint=bigint 的 join 去掉 convert 恢复 SARGable
 
 原二维码分支 `convert(varchar,t2.OBJID) = (select PLAN_DETAIL_ID from BPM_PRODUCTION where GREEN_TYRE_NO=...)`——sys.columns 核实两侧均为 **bigint** 后，`convert(varchar)` 纯属多余且令明细表只能全表扫；去掉后 `t2.OBJID = (子查询)` 直接走 OBJID 唯一索引。GREEN_TYRE_NO 为该表唯一主键 → 标量子查询必单行，`=` 无多行报错风险。**函数包列先查两侧真实类型再定去留**。
 
-### 8.5 varchar 列 = date 列的 join：小维度表不必动
+### 9.5 varchar 列 = date 列的 join：小维度表不必动
 
 `PLAN_DATE(varchar) = SSB_SHIFT_TIME.ShiftDT(date)` 按类型优先级逐行隐转 varchar 侧，但班次时间表是每天每班一条的小维度表，逐行转换代价可忽略——为工作正常的 join 动刀不值。隐转的实际危害在大表扫描/join 场景，小维度表上"知道即可不处理"。
 
-### 8.6 审查流程教训（呼应本文档既有原则）
+### 9.6 审查流程教训（呼应本文档既有原则）
 
 - SQL 重交付（含 proc 改造）默认 expert-sql 审查：本次 byte 级核验抓出转写多一个引号的 P0（ALTER 必编译失败 + 8 参数传旧 proc 连锁 8144），详 `extnet-query-control-upgrade.md` §九
 - 手打/复写 proc 体后必须与原始导出件 difflib 逐行 diff，偏差逐条对应"有意改动清单"

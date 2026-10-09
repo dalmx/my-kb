@@ -73,6 +73,11 @@ STALE_DAYS = 365
 CONFIDENCE_HIGH = 0.5   # top1 >= 0.5 高置信
 CONFIDENCE_LOW = 0.3    # top1 < 0.3 低置信（很可能无相关知识），中间为存疑
 
+# 回收站保留策略（2026-10-09 P0 接线）：同一原文件最多保留最近 N 版、超龄（天）清理；
+# 删除/覆盖前移入 knowledge/{kb}/raw/trash/，移动失败则中止操作（fail-safe）
+TRASH_KEEP_VERSIONS = 3
+TRASH_MAX_AGE_DAYS = 30
+
 # 检索缺口日志（Agentic RAG 方向四：低置信检索自动记录，供回顾补文档）
 GAP_LOG_ENABLED = True
 GAP_LOG_PATH = Path(__file__).resolve().parent / "gap_log.jsonl"
@@ -121,7 +126,7 @@ RULE_H3_WEIGHT = 0.08    # 介于 h2(0.10) 与 tags(0.08) 之间
 # （≤0.02，只破平局不压制语义分）再 A/B
 SECTION_INDEX_ENABLED = False
 SECTION_TOP_K = 6        # 查 sections 取前 K 个节
-SECTION_BOOST = 0.08     # 命中节旗下 chunk 的规则减分（与 tags 同档）
+SECTION_BOOST = 0.08     # 命中节旗下 chunk 的规则加分（与 tags 同档；P1-1 方向统一后为加成）
 
 # 混合检索配置（向量 + BM25 关键词召回，RRF 融合）
 ENABLE_HYBRID_SEARCH = True
