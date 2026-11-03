@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -79,19 +80,29 @@ def _service_alive():
         return False
 
 
+# 进程内拉起互斥（2026-11-03 MiMo 审查 1c/1h）：msvcrt 对"同进程双句柄"是否互斥
+# 属平台未验证语义，http 常驻进程多线程并发 ensure 会双拉 model_service（历史
+# 3 实例并存教训），叠加 threading.Lock 与平台语义解耦，锁序恒为 thread→file
+_thread_service_lock = threading.Lock()
+
+
 @contextlib.contextmanager
 def _service_lock():
     """跨进程拉起锁（Windows msvcrt，锁首字节）。抢不到（~10s 超时）抛 OSError。"""
     import msvcrt
-    with open(_SERVICE_LOCK, "a+") as lf:
-        msvcrt.locking(lf.fileno(), msvcrt.LK_LOCK, 1)
-        try:
-            yield
-        finally:
+    _thread_service_lock.acquire()
+    try:
+        with open(_SERVICE_LOCK, "a+") as lf:
+            msvcrt.locking(lf.fileno(), msvcrt.LK_LOCK, 1)
             try:
-                msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
-            except OSError:
-                pass
+                yield
+            finally:
+                try:
+                    msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+    finally:
+        _thread_service_lock.release()
 
 
 def _spawn_service():

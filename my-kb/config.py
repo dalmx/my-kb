@@ -147,6 +147,12 @@ MODEL_SERVICE_PORT = 18737
 # 2026-08-27 1800→7200：空闲自杀后重连首个调用撞上"重拉模型+冷启动"，
 # 与 Chroma 打开卡顿叠加顶满客户端 180s 超时（见 runtime.log 11:00 事件），放宽减少叠加概率
 MODEL_SERVICE_IDLE_EXIT_SEC = 7200        # 无请求 2 小时自动退出
+# my-kb MCP 的 streamable-http 常驻入口（http_entry.py）：ZCode 以 type:http 直连，
+# 免 stdio 每会话 spawn（实测 ~1.9s = python 50ms + import 692ms + 握手）。
+# 由 SessionStart hook --ensure 拉起，常驻不空闲退出（本进程不含模型/向量库，仅转发层）
+MYKB_HTTP_HOST = "127.0.0.1"
+MYKB_HTTP_PORT = 18739
+
 MODEL_SERVICE_LOG = Path(__file__).resolve().parent / "model_service.log"
 
 # 运行日志落盘（utils.log tee）：所有会话 server.py + model_service 共用一个文件，
@@ -182,5 +188,5 @@ _vectorstores = {}   # {kb_id: Chroma 实例}，按需懒加载
 _embeddings = None   # 嵌入模型全局单例（多库共用同一模型）
 _reranker = None     # cross-encoder 重排模型全局单例
 _bm25_retrievers = {}  # {kb_id: BM25Retriever 实例}，按需懒加载（内存索引）
-_async_tasks = {}    # {task_key: asyncio.Task}，后台异步任务追踪
+_async_tasks = {}    # {task_key: threading.Thread}，后台异步任务追踪（is_alive 判活）
 _info_cache = {}     # {kb_id: (timestamp, data)}，get_knowledge_info 缓存

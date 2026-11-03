@@ -17,6 +17,7 @@ from hit_stats import record_hits
 from utils import log, validate_kb_id, file_lock
 import datetime
 import json
+import threading
 import time
 
 # 缺口日志进程内去重表：{查询文本key: 上次记录时间戳}
@@ -28,12 +29,19 @@ class KnowledgeRetriever:
 
     def __init__(self):
         # sections 粗索引寻址信号：本轮检索命中的 (source, h2) 章节键集合，
-        # 由 _hybrid_recall 填充（SECTION_INDEX_ENABLED 时），规则重排层消费
-        self._section_keys = set()
+        # 由 _hybrid_recall 填充（SECTION_INDEX_ENABLED 时），规则重排层消费。
+        # threading.local（2026-11-03 MiMo 审查 1b）：http 常驻后多线程并发检索
+        # 共享本单例，实例级 set 会互相 reset/污染加成信号（排序噪声）——
+        # 每线程独立视图，消费触点经 property 零改动（未 reset 时 None 短路）
+        self._tl = threading.local()
+
+    @property
+    def _section_keys(self):
+        return getattr(self._tl, "keys", None)
 
     def _reset_section_keys(self):
         """每次检索入口清空章节信号（multi 检索内多次召回取并集）。"""
-        self._section_keys = set()
+        self._tl.keys = set()
 
     def search(self, query, n_results=5, kb_id=None, category=None, module=None, tags=None, factory=None):
         """执行四层检索，返回 (results_text, top_hits)。

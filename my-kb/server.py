@@ -15,7 +15,9 @@
 import asyncio
 import re
 import json
+import hashlib
 import datetime
+import threading
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import (
@@ -31,6 +33,16 @@ from config import (
 )
 from utils import log, validate_kb_id, is_safe_filename, kb_markdown_dir, file_lock
 from models import preload, get_vectorstore, get_reranker, WarmupBusyError
+
+# ── 写前基线校验（2026-10-30 与 MiMo 讨论定稿，防多会话并发覆盖丢更新）──
+# get_source 返回尾部附指纹注释行；save_markdown/merge_sources 传 expected_hash 时
+# 在写锁内比对磁盘现行版（不符/不存在/拿不到锁均拒写）。指纹=归一化（CRLF→LF）
+# sha256 前 32 位：与读回文本口径一致、免疫换行 churn；三处调用点共用防漂移。
+_FP_NOTE_RE = re.compile(r'<!-- my-kb-fp: [0-9a-f]+ -->\s*\n?')
+
+
+def _fp(raw: bytes) -> str:
+    return hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest()[:32]
 from preprocessing import (
     parse_frontmatter, build_chunk_metadata, infer_title_from_h1, validate_doc_format,
     frontmatter_segment, build_merged_document,
@@ -229,18 +241,20 @@ async def list_tools():
                 "6. ## 章节标题用中文序号（## 一、## 二、…，首字符为中文数字；全文无 ## 章节的短文不强制）\n"
                 "7. 代码开栏围栏必须标注语言（```python / ```sql / ```aspx；闭合行裸 ``` 属正常）\n"
                 "8. updated（可选）：YYYY-MM-DD 最后确认有效日期，缺省自动填今天\n"
-                "9. status（可选）：active/deprecated/archived（缺省 active；旧方案被新文档取代时标 deprecated 并在正文注明替代文档）"
+                "9. status（可选）：active/deprecated/archived（缺省 active；旧方案被新文档取代时标 deprecated 并在正文注明替代文档）\n"
+                "覆盖防丢更新：覆盖既有文档前必须先 get_source 读最新版，并把其返回尾注 <!-- my-kb-fp: ... --> 中的指纹作为 expected_hash 传回——磁盘版本已变/文件已删（可能被其他会话先写）则拒写；新建文档或不传则不校验（不传=放行，与旧行为一致）"
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "filename": {"type": "string", "description": "文件名（不含路径，需包含.md后缀）"},
-                    "content": {"type": "string", "description": "Markdown文件内容（可含首部 YAML frontmatter 写元数据）"},
+                    "content": {"type": "string", "description": "Markdown文件内容（可含首部 YAML frontmatter 写元数据；含 my-kb-fp 尾注行会被自动剥离）"},
                     "kb_id": {"type": "string", "default": "mes", "description": "知识库ID"},
                     "category": {"type": "string", "description": "分类（如 技术-.NET / 技术-数据库 / 业务-通用 / 部署运维），缺省读 frontmatter"},
                     "module": {"type": "string", "description": "模块（如 Ext.NET / 功能实现 / 通用 / 部材），缺省读 frontmatter"},
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "标签列表"},
-                    "auto_index": {"type": "boolean", "default": True, "description": "True=保存后自动索引（默认）；False=仅保存不索引"}
+                    "auto_index": {"type": "boolean", "default": True, "description": "True=保存后自动索引（默认）；False=仅保存不索引"},
+                    "expected_hash": {"type": "string", "description": "写前基线校验（防多会话并发覆盖丢更新）：get_source 返回尾注中的内容指纹。传入后磁盘现行版必须存在且指纹一致，否则拒写（原文件不动）"}
                 },
                 "required": ["filename", "content"]
             }
@@ -363,21 +377,22 @@ async def list_tools():
         ),
         Tool(
             name="merge_sources",
-            description="合并多个文档为一个目标文档：写入合并内容、更新引用、删除旧文件及其索引、索引目标文件。",
+            description="合并多个文档为一个目标文档：写入合并内容、更新引用、删除旧文件及其索引、索引目标文件。target 已存在时若传 expected_hash（get_source 尾注指纹）则做写前基线校验，版本已变拒写。",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "sources": {"type": "array", "items": {"type": "string"}, "description": "待合并的旧文件名列表"},
                     "target": {"type": "string", "description": "合并后的目标文件名"},
                     "kb_id": {"type": "string", "default": "mes", "description": "知识库ID"},
-                    "content": {"type": "string", "description": "合并后的完整内容。不传则按 sources 顺序拼接正文。"}
+                    "content": {"type": "string", "description": "合并后的完整内容。不传则按 sources 顺序拼接正文。含 my-kb-fp 尾注行会被自动剥离"},
+                    "expected_hash": {"type": "string", "description": "target 已存在时的写前基线校验：get_source 返回尾注中的内容指纹，不匹配则中止合并"}
                 },
                 "required": ["sources", "target"]
             }
         ),
         Tool(
             name="get_source",
-            description="按文件名读取知识库中某篇文档的完整内容（含 frontmatter）。",
+            description="按文件名读取知识库中某篇文档的完整内容（含 frontmatter）。返回尾部附内容指纹注释行 <!-- my-kb-fp: ... -->：覆盖写入（save_markdown/merge_sources）时必须作为 expected_hash 传回做写前基线校验；该行是元数据，勿当正文使用（写回时会被自动剥离）。",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -490,11 +505,17 @@ def _audit(kb_id, tool, detail):
     _git_autocommit(detail)
 
 
+_git_lock = threading.Lock()  # 2026-11-03 MiMo 1g：http 单进程时代进程内锁即完全串行
+
+
 def _git_autocommit(detail):
     """写操作后自动提交 git 基线（F:/rag）。
     add 范围限 knowledge/（vectordb/log/lock 已被 .gitignore 排除）；
-    任何失败静默——多会话并发 commit 撞 index.lock 属预期，下次写库自然补上，
-    周五体检周报另有未提交提醒兜底。"""
+    进程内 _git_lock 串行（2026-11-03 加——http 单进程后所有写经本进程，
+    并发 add/commit 撞 index.lock 会静默丢提交且消息错位）；
+    任何失败静默——残余失败下次写库自然补上，周五体检周报另有未提交提醒兜底。"""
+    if not _git_lock.acquire(timeout=70):  # add+commit 各 30s 超时，排队上限略宽
+        return
     try:
         import subprocess
         root = str(KB_ROOT.parent)
@@ -504,6 +525,8 @@ def _git_autocommit(detail):
                        cwd=root, timeout=30, capture_output=True)
     except Exception:
         pass
+    finally:
+        _git_lock.release()
 
 
 async def call_tool(name: str, arguments: dict):
@@ -692,6 +715,14 @@ async def call_tool(name: str, arguments: dict):
                 lines.append(f"\n[{cur_kb}]")
                 lines.append(f"- 文档块数量: {doc_count}")
                 lines.append(f"- 唯一文件数: {len(cat_by_file)}")
+                # P3（2026-10-30）：raw 文件数 vs 索引 source 数对账——索引半完成态自动暴露
+                raw_dir = KB_ROOT / cur_kb / "raw"
+                raw_count = sum(1 for sub in ("markdown", "pdf") if (raw_dir / sub).exists()
+                                for f in (raw_dir / sub).glob("*")
+                                if f.is_file() and f.suffix.lower() in (".md", ".pdf", ".txt"))
+                if raw_count != len(cat_by_file):
+                    lines.append(f"- ⚠️ raw 目录 {raw_count} 个文件 vs 索引 {len(cat_by_file)} 个，"
+                                 f"差值疑似索引半完成态，可调 index_all_files 补齐")
                 lines.append(f"- 分类统计:")
                 for cat in sorted(cat_counts.keys()):
                     lines.append(f"    {cat}: {cat_counts[cat]} 个文件")
@@ -726,6 +757,7 @@ async def call_tool(name: str, arguments: dict):
             module = arguments.get("module")
             tags = arguments.get("tags")
             auto_index = arguments.get("auto_index", True)
+            expected_hash = arguments.get("expected_hash", "")
             validate_kb_id(kb_id)
 
             if not filename:
@@ -734,6 +766,9 @@ async def call_tool(name: str, arguments: dict):
                 filename = filename + ".md"
             if not is_safe_filename(filename):
                 return [TextContent(type="text", text="错误: 文件名包含非法字符")]
+
+            # 剥离 get_source 尾注指纹行（防写回沉淀；无论是否传 expected_hash 一律剥）
+            content = _FP_NOTE_RE.sub("", content)
 
             # 格式校验：阻止不规范的文档被写入（防止 frontmatter 缺失/不闭合等问题）
             ok, errors = validate_doc_format(content)
@@ -756,7 +791,17 @@ async def call_tool(name: str, arguments: dict):
             save_path = save_dir / filename
             # 覆盖保护（P0 2026-10-09）：旧版先入回收站，失败则中止写入（原文件不动）
             # P2：trash+写盘包进 KB 级 markdown 写锁，防并发写交错
-            with file_lock(save_dir.parent / "markdown_write.lock"):
+            # 写前基线校验（2026-10-30）：单条件——传了 expected_hash 就必须锁拿到+文件存在
+            # +指纹匹配；file_lock 超时会放行继续（防死锁的既有设计），正确性路径 fail-closed
+            with file_lock(save_dir.parent / "markdown_write.lock") as _locked:
+                if expected_hash:
+                    if not _locked:
+                        return [TextContent(type="text", text="错误: 写锁获取超时，expected_hash 校验无法原子执行，已拒写（未改动任何文件），请重试")]
+                    if not save_path.exists():
+                        return [TextContent(type="text", text=f"错误: expected_hash 校验失败——{filename} 不存在（可能已被删除/改名），如确要新建请不带 expected_hash 重试")]
+                    _cur = _fp(save_path.read_bytes())
+                    if _cur != expected_hash:
+                        return [TextContent(type="text", text=f"错误: 磁盘版本已变（当前指纹 {_cur}，你基于 {expected_hash}）——另一会话可能已修改，请 get_source 重读最新版再改写")]
                 if save_path.exists():
                     ok_t, info_t = _trash_file(kb_id, filename)
                     if not ok_t:
@@ -907,20 +952,25 @@ async def call_tool(name: str, arguments: dict):
             force = arguments.get("force", True)
             validate_kb_id(kb_id)
             task_key = f"_rebuild_{kb_id}"
-            if task_key in _async_tasks and not _async_tasks[task_key].done():
+            t = _async_tasks.get(task_key)
+            if t is not None and t.is_alive():
                 return [TextContent(type="text", text=f"库 {kb_id} 的后台重建任务已在运行中，请等待完成")]
 
-            async def _do_rebuild():
+            def _do_rebuild():
                 try:
-                    import asyncio
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, sync_rebuild, kb_id, force)
+                    sync_rebuild(kb_id, force)
                 except Exception as e:
                     log(f"[异步重建] 出错: {e}")
                 finally:
                     _async_tasks.pop(task_key, None)
 
-            _async_tasks[task_key] = asyncio.create_task(_do_rebuild())
+            # threading 版（2026-11-03 MiMo 审查修复）：原 asyncio.create_task 建在
+            # asyncio.run(call_tool) 的临时 loop 上，loop 清理时 cancel task 并阻塞等
+            # executor——"异步"重建变同步拖满客户端超时。daemon 线程存活于临时 loop
+            # 之后，stdio/http 双模式同修。
+            t = threading.Thread(target=_do_rebuild, daemon=True, name=task_key)
+            _async_tasks[task_key] = t
+            t.start()
             _audit(kb_id, "rebuild_index_async", "force=%s" % force)
             return [TextContent(type="text", text=f"异步重建已启动（库 {kb_id}）。后台处理中，进度输出到 stderr 日志。")]
 
@@ -971,22 +1021,25 @@ async def call_tool(name: str, arguments: dict):
 
             index_msg = ""
             if reindex_flag:
-                # 删旧索引（P1-3：where 精确拉取免全量 get；失败必 log，不再静默）
-                try:
-                    vs = get_vectorstore(kb_id)
-                    results = vs.get(where={"source": source})
-                    old_ids = list(results.get("ids", []))
-                    if old_ids:
-                        vs.delete(ids=old_ids)
-                except Exception as e:
-                    log(f"move_source 删旧索引失败 {source}（旧名残留可经 index_all_files(force=True) 清理）: {e}")
-                # P1（CC 审查 20260908）：旧名 sections 同步清理（新名由 _index_file 挂钩重建；门控）
-                try:
-                    from section_index import delete_source_sections
-                    delete_source_sections(kb_id, source)
-                except Exception:
-                    pass
+                # add-then-prune 换序（2026-10-30）：先索引新名、后删旧名——索引失败时
+                # 旧块仍在、文档不消失（残留旧名块可经 index_all_files(force=True) 清理）
                 success, index_msg = _index_file(filename=new_name, kb_id=kb_id)
+                if success:
+                    # 删旧索引（P1-3：where 精确拉取免全量 get；失败必 log，不再静默）
+                    try:
+                        vs = get_vectorstore(kb_id)
+                        results = vs.get(where={"source": source})
+                        old_ids = list(results.get("ids", []))
+                        if old_ids:
+                            vs.delete(ids=old_ids)
+                    except Exception as e:
+                        log(f"move_source 删旧索引失败 {source}（旧名残留可经 index_all_files(force=True) 清理）: {e}")
+                    # P1（CC 审查 20260908）：旧名 sections 同步清理（新名已由上方 _index_file 挂钩重建；门控）
+                    try:
+                        from section_index import delete_source_sections
+                        delete_source_sections(kb_id, source)
+                    except Exception:
+                        pass
 
             _audit(kb_id, "move_source", f"{source} -> {new_name}")
             msg = f"重命名成功（库 {kb_id}）:\n- {source} → {new_name}"
@@ -1129,6 +1182,7 @@ async def call_tool(name: str, arguments: dict):
             target = arguments.get("target", "")
             kb_id = arguments.get("kb_id", DEFAULT_KB_ID)
             content = arguments.get("content")
+            expected_hash = arguments.get("expected_hash", "")
             validate_kb_id(kb_id)
 
             if not sources or not target:
@@ -1146,7 +1200,7 @@ async def call_tool(name: str, arguments: dict):
             target_path = md_dir / target
 
             if content:
-                final_content = content
+                final_content = _FP_NOTE_RE.sub("", content)
             else:
                 # 拼接路径：剥各源 frontmatter 与 H1，统一为 target 的 title（消除多 H1），
                 # 文首摘要注明合并来源；frontmatter 基底优先 target 既有 fm，缺省用第一个源的 fm
@@ -1197,7 +1251,16 @@ async def call_tool(name: str, arguments: dict):
             # 全部成功后才写 target、改引用、清向量块、重建索引
             md_dir.mkdir(parents=True, exist_ok=True)
             # P2：两阶段 trash + 写 target + 引用更新全程持 markdown 写锁
-            with file_lock(md_dir.parent / "markdown_write.lock"):
+            # target 写前基线校验（2026-10-30，与 save_markdown 同款单条件+fail-closed）
+            with file_lock(md_dir.parent / "markdown_write.lock") as _locked:
+                if expected_hash:
+                    if not _locked:
+                        return [TextContent(type="text", text="错误: 写锁获取超时，expected_hash 校验无法原子执行，已中止合并（未做任何更改），请重试")]
+                    if not target_path.exists():
+                        return [TextContent(type="text", text=f"错误: expected_hash 校验失败——{target} 不存在，如确要合并到新建 target 请不带 expected_hash 重试")]
+                    _cur = _fp(target_path.read_bytes())
+                    if _cur != expected_hash:
+                        return [TextContent(type="text", text=f"错误: 目标磁盘版本已变（当前指纹 {_cur}，你基于 {expected_hash}）——另一会话可能已修改，请 get_source 重读后再合并")]
                 if target_path.exists():
                     ok_t, info_t = _trash_file(kb_id, target)
                     if not ok_t:
@@ -1220,33 +1283,36 @@ async def call_tool(name: str, arguments: dict):
                 for src in sources:
                     ref_changed += update_references(kb_id, src, target)
 
-            vs = get_vectorstore(kb_id)
+            # add-then-prune 换序（2026-10-30）：先索引 target、后删旧源——target 索引失败时
+            # 旧源块仍在、知识不消失（残留旧源块可经 index_all_files(force=True) 清理）
             deleted_files = len(trashed_sources)
-            for src in sources:
-                if not src.endswith(".md"):
-                    src = src + ".md"
+            success, index_msg = _index_file(filename=target, kb_id=kb_id)
+            if success:
+                vs = get_vectorstore(kb_id)
+                for src in sources:
+                    if not src.endswith(".md"):
+                        src = src + ".md"
+                    try:
+                        results = vs.get(where={"source": src})
+                        old_ids = list(results.get("ids", []))
+                        if old_ids:
+                            vs.delete(ids=old_ids)
+                    except Exception as e:
+                        log(f"merge_sources 删旧索引失败 {src}（残留可经 index_all_files(force=True) 清理）: {e}")
+                    # P1（CC 审查 20260908）：旧 source 的 sections 粗索引同步清理（门控）
+                    try:
+                        from section_index import delete_source_sections
+                        delete_source_sections(kb_id, src)
+                    except Exception:
+                        pass
+
+                # 删了旧块后失效 BM25（幂等无妨）
                 try:
-                    results = vs.get(where={"source": src})
-                    old_ids = list(results.get("ids", []))
-                    if old_ids:
-                        vs.delete(ids=old_ids)
-                except Exception as e:
-                    log(f"merge_sources 删旧索引失败 {src}（残留可经 index_all_files(force=True) 清理）: {e}")
-                # P1（CC 审查 20260908）：旧 source 的 sections 粗索引同步清理（门控）
-                try:
-                    from section_index import delete_source_sections
-                    delete_source_sections(kb_id, src)
+                    from bm25_manager import invalidate
+                    invalidate(kb_id)
                 except Exception:
                     pass
 
-            # 删了旧块后失效 BM25（后续 _index_file 成功时也会再失效一次，幂等无妨）
-            try:
-                from bm25_manager import invalidate
-                invalidate(kb_id)
-            except Exception:
-                pass
-
-            success, index_msg = _index_file(filename=target, kb_id=kb_id)
             _audit(kb_id, "merge_sources", f"{len(sources)}源 -> {target}")
             msg = f"合并成功（库 {kb_id}）:\n- 合并 {len(sources)} 个文件 → {target}\n- 删除旧文件: {deleted_files}\n- 更新引用: {ref_changed} 处\n- 格式校验: 通过\n- {index_msg}"
             if dup_errors:
@@ -1267,9 +1333,12 @@ async def call_tool(name: str, arguments: dict):
             file_path = kb_markdown_dir(kb_id) / filename
             if not file_path.exists():
                 return [TextContent(type="text", text=f"错误: 文件不存在: {filename}")]
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            return [TextContent(type="text", text=content)]
+            raw = file_path.read_bytes()
+            norm = raw.replace(b"\r\n", b"\n")
+            # 显示文本维持 LF 行为（等价原 open("r") universal newline）；尾注为元数据，
+            # 写回时 save_markdown/append_section 会剥离，覆盖写入须作为 expected_hash 传回
+            return [TextContent(type="text", text=norm.decode("utf-8")
+                                + f"\n<!-- my-kb-fp: {_fp(raw)} -->\n")]
 
         # ── 追加章节 ──
         elif name == "append_section":
@@ -1287,6 +1356,8 @@ async def call_tool(name: str, arguments: dict):
                 return [TextContent(type="text", text="错误: 文件名不能为空")]
             if not is_safe_filename(filename):
                 return [TextContent(type="text", text="错误: 文件名包含非法字符")]
+            # 剥离 get_source 尾注指纹行（防追加时写回沉淀）
+            content = _FP_NOTE_RE.sub("", content)
             file_path = kb_markdown_dir(kb_id) / filename
             if not file_path.exists():
                 return [TextContent(type="text", text=f"错误: 文件不存在: {filename}")]
@@ -1370,12 +1441,19 @@ async def call_tool(name: str, arguments: dict):
         return [TextContent(type="text", text=f"⏳ {e}")]
     except Exception as e:
         import traceback
+        # 留痕 runtime.log（2026-10-30 教训：traceback 只回给客户端，客户端超时后无人看见）
+        log(f"工具 {name} 出错: {e}\n{traceback.format_exc()}")
         return [TextContent(type="text", text=f"错误: {e}\n{traceback.format_exc()}")]
 
 
 # ── mcp 2.x 显式注册（替代 1.x @server.call_tool() 装饰器；分发体内容零改动）──
+# asyncio.to_thread（2026-11-03）：call_tool 内部基本是同步代码（文件 IO/urllib 转发），
+# http_entry 常驻模式下直接 await 会阻塞 event loop——一个写库（5-20s）卡住所有
+# 会话的检索。线程化后 stdio 模式同样无害（单会话无并发）。
 async def _on_call_tool(ctx, params):
-    return CallToolResult(content=await call_tool(params.name, params.arguments or {}))
+    def _run():
+        return asyncio.run(call_tool(params.name, params.arguments or {}))
+    return CallToolResult(content=await asyncio.to_thread(_run))
 
 
 server.add_request_handler("tools/call", CallToolRequestParams, _on_call_tool)

@@ -124,6 +124,7 @@ class RemoteVectorstore:
 # ---- S3① 远程模式回收：粘性 True 无回收路径的问题 ----
 _REMOTE_FAIL_STREAK_LIMIT = 2
 _remote_fail_streak = 0
+_fail_streak_lock = threading.Lock()  # 2026-11-03 MiMo 1i：+= 非原子，并发少计会延迟翻本地
 
 
 def note_remote_vector_success():
@@ -139,7 +140,8 @@ def note_remote_vector_failure(err):
     检索走本地 chroma 慢路径；冷却到期自动重探远程（服务恢复则切回）。
     """
     global _remote_vector_mode, _remote_vector_fail_ts, _remote_fail_streak
-    _remote_fail_streak += 1
+    with _fail_streak_lock:
+        _remote_fail_streak += 1
     if _remote_vector_mode is True and _remote_fail_streak >= _REMOTE_FAIL_STREAK_LIMIT:
         _remote_vector_mode = False
         _remote_vector_fail_ts = time.time()

@@ -6,6 +6,7 @@ import contextlib
 import datetime
 import os
 import sys
+import threading
 import time
 from config import ALLOWED_KB_IDS, KB_ROOT, RUNTIME_LOG
 
@@ -30,14 +31,29 @@ def log(msg):
         pass
 
 
+# 进程内 threading 锁注册表（2026-11-03 MiMo 审查 1c 加固）：msvcrt/LockFile 对
+# "同进程两个文件句柄"是否互斥属平台未验证语义，http 常驻后写路径首次被多线程并发
+# 进入——叠加进程内按路径互斥，与平台语义解耦，锁序恒为 thread→file 防死锁
+_thread_locks: dict = {}
+_thread_locks_guard = threading.Lock()
+
+
 @contextlib.contextmanager
 def file_lock(lock_path, timeout=60):
     """跨进程文件锁（Windows msvcrt / POSIX fcntl 双平台；独立 .lock 文件）。
 
+    叠加进程内 threading 锁（同路径同进程互斥，见 _thread_locks 注释）。
     等待至多 timeout 秒，超时放弃加锁继续执行并返回 locked=False——锁是防并发
     写坏的优化而非硬门槛，绝不死锁（与 chroma 开库锁同哲学）。用法：
     `with file_lock(p) as locked: ...`。
     """
+    key = str(lock_path)
+    with _thread_locks_guard:
+        tlk = _thread_locks.get(key)
+        if tlk is None:
+            tlk = threading.Lock()
+            _thread_locks[key] = tlk
+    got_tl = tlk.acquire(timeout=timeout)  # 超时放行（与文件锁"绝不死锁"哲学一致）
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fh = open(lock_path, "a+")
     locked = False
@@ -76,6 +92,8 @@ def file_lock(lock_path, timeout=60):
                 except Exception:
                     pass
         fh.close()
+        if got_tl:
+            tlk.release()
 
 
 def validate_kb_id(kb_id):
