@@ -520,9 +520,11 @@ def _git_autocommit(detail):
         import subprocess
         root = str(KB_ROOT.parent)
         subprocess.run(["git", "add", "-A", "knowledge/"], cwd=root,
-                       timeout=30, capture_output=True)
+                       timeout=30, capture_output=True,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         subprocess.run(["git", "commit", "-m", "kb-write: %s" % detail[:120], "--quiet"],
-                       cwd=root, timeout=30, capture_output=True)
+                       cwd=root, timeout=30, capture_output=True,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except Exception:
         pass
     finally:
