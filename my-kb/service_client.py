@@ -24,6 +24,7 @@ from pathlib import Path
 from config import (
     MODEL_SERVICE_HOST, MODEL_SERVICE_PORT, MODEL_SERVICE_LOG,
 )
+from utils import log
 
 _SERVICE_DIR = Path(__file__).resolve().parent
 _SERVICE_SCRIPT = _SERVICE_DIR / "model_service.py"
@@ -42,13 +43,18 @@ _ensure_fail_cooldown_until = 0.0
 import uuid
 _CHUNK_NS = uuid.uuid5(uuid.NAMESPACE_URL, "my-kb/chunk/v1")
 
+# A 埋点（2026-11-09）：调用方标识随每个 POST 透传给服务端 perf 日志；缺省 pid:N
+# 可与 runtime.log 的 [pid N] 行对账区分进程；部署方可设 MYKB_CALLER 显式命名
+_CALLER = os.environ.get("MYKB_CALLER") or f"pid:{os.getpid()}"
+
 
 def _request(path, payload=None, timeout=60):
     """GET/POST 一次 HTTP 请求。连接失败/HTTP 错误时抛异常。"""
     if payload is None:
         req = urllib.request.Request(_BASE_URL + path, method="GET")
     else:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        # caller 透传（A 埋点）：不改变业务字段，服务端缺省 unknown
+        body = json.dumps({**payload, "caller": _CALLER}, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
             _BASE_URL + path, data=body, method="POST",
             headers={"Content-Type": "application/json; charset=utf-8"},
@@ -179,15 +185,21 @@ def _call_model(path, payload, timeout=120):
     拉起成功（常见瞬断：空闲自杀后首调）则正常重试，不受冷却影响。
     """
     global _ensure_fail_cooldown_until
+    t0 = time.perf_counter()
     try:
         return _request(path, payload, timeout=timeout)
     except Exception:
         if time.time() < _ensure_fail_cooldown_until:
             raise
+        # A 埋点（2026-11-09）：重拉+重试全程入账——服务瞬断（空闲自杀/被杀）叠加
+        # 13s 级冷启动是写尖峰候选，此前全程静默无法归因
+        log(f"[perf] _call_model {path} 首调失败，重拉服务+重试中（已耗 {time.perf_counter() - t0:.1f}s）")
         if not ensure_model_service(wait_ready=True, timeout=120):
             _ensure_fail_cooldown_until = time.time() + _ENSURE_FAIL_COOLDOWN_SEC
             raise
-        return _request(path, payload, timeout=timeout)
+        resp = _request(path, payload, timeout=timeout)
+        log(f"[perf] _call_model {path} 重拉+重试成功，本次总耗时 {time.perf_counter() - t0:.1f}s")
+        return resp
 
 
 def split_via_service(body):

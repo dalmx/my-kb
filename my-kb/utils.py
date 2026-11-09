@@ -16,11 +16,13 @@ def log(msg):
 
     文件侧用 O_APPEND + 单次 os.write，多进程并发追加同一行不会交错；
     落盘失败静默忽略——日志绝不能影响业务。
+    2026-11-09：stderr 侧同样带时间戳+PID（原先只有文件侧带）——faulthandler
+    崩溃栈落 model_service.log（stderr 重定向）时无时间戳只能按行序猜，死后取证靠它。
     """
     line = f"[my-kb] {msg}"
-    print(line, file=sys.stderr, flush=True)
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    print(f"[{stamp}] [pid {os.getpid()}] {line}", file=sys.stderr, flush=True)
     try:
-        stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         entry = f"[{stamp}] [pid {os.getpid()}] {line}\n".encode("utf-8", "replace")
         fd = os.open(str(RUNTIME_LOG), os.O_WRONLY | os.O_CREAT | os.O_APPEND)
         try:

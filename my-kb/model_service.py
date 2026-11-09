@@ -195,10 +195,16 @@ def _load_models():
 
 
 def _idle_watchdog():
-    """空闲自动退出：释放 GPU 显存，下次使用时由调用方自动重新拉起。"""
+    """空闲自动退出：释放 GPU 显存，下次使用时由调用方自动重新拉起。
+    2026-11-09：每 5min 心跳存活戳——服务被外部终止（job 随会话退出/外部安全软件）时
+    无告别消失，死后窗口可凭最后心跳界定到分钟级。"""
+    last_beat = time.time()
     while True:
         time.sleep(60)
         idle = time.time() - _state["last_request"]
+        if time.time() - last_beat >= 300:
+            last_beat = time.time()
+            log(f"[model-service] 心跳存活 idle={int(idle)}s")
         if idle > MODEL_SERVICE_IDLE_EXIT_SEC:
             log(f"[model-service] 空闲 {int(idle)}s 超过 {MODEL_SERVICE_IDLE_EXIT_SEC}s，自动退出")
             os._exit(0)
@@ -278,10 +284,17 @@ def _get_bm25(kb_id):
     import models 会在服务进程内再开一份 chroma）。
     S1 代际护栏：构建读快照期间若有写入（gen 变化），丢弃本次构建重试一轮，
     防止"旧快照索引在写失效之后落缓存"造成的永久陈旧。
+    2026-11-09 BM25 出锁（性能治理第一步）：jieba 分词/建索引（~4s 大头）挪出
+    _store_open_lock，"gen 检查+落缓存"留在小临界区与 _invalidate_bm25 互斥——
+    护栏从冗余保险变承重结构，末段这两步若也出锁会自造"旧索引在 pop 后落缓存"
+    的永久陈旧事故。重试 2→3：持续写入期减少假降级。并发重复构建 benign
+    （两个等新鲜度 retriever 先后落缓存，后者覆盖前者）。
     """
     if kb_id in _bm25_retrievers:
         return _bm25_retrievers[kb_id]
-    for _attempt in range(2):
+    retriever = None
+    docs = []
+    for _attempt in range(3):
         with _store_open_lock:
             if kb_id in _bm25_retrievers:
                 return _bm25_retrievers[kb_id]
@@ -290,29 +303,43 @@ def _get_bm25(kb_id):
                 _bm25_retrievers[kb_id] = None
                 return None
             try:
-                from langchain_community.retrievers import BM25Retriever
-                from langchain_core.documents import Document
                 gen_before = _bm25_gen.get(kb_id, 0)
                 results = store.get()
-                docs = [Document(page_content=t, metadata=m or {})
-                        for t, m in zip(results.get("documents", []), results.get("metadatas", [])) if t]
-                if not docs:
+            except Exception as e:
+                log(f"[model-service] BM25 快照拉取失败（该库 BM25 通道降级）: {e}")
+                _bm25_retrievers[kb_id] = None
+                return None
+        # ↑ 小临界区①结束：gen 读 + 快照 get + 开库
+        # 锁外重活：构造 Document 列表 + jieba 分词建索引
+        try:
+            from langchain_community.retrievers import BM25Retriever
+            from langchain_core.documents import Document
+            docs = [Document(page_content=t, metadata=m or {})
+                    for t, m in zip(results.get("documents", []), results.get("metadatas", [])) if t]
+            if not docs:
+                # 空库判定也要与失效互斥（小临界区②）：gen 未变才缓存 None
+                with _store_open_lock:
                     if _bm25_gen.get(kb_id, 0) == gen_before:
                         _bm25_retrievers[kb_id] = None
                         return None
-                    continue  # 构建期间有写，重试
-                retriever = BM25Retriever.from_documents(
-                    docs, k=BM25_POOL_K, preprocess_func=_jieba_tokenize)
-                if _bm25_gen.get(kb_id, 0) != gen_before:
-                    continue  # 构建期间有写，丢弃本次索引重建
-                _bm25_retrievers[kb_id] = retriever
-                log(f"[model-service] 已构建 BM25 索引: {kb_id} ({len(docs)} 块，服务常驻)")
-                return retriever
-            except Exception as e:
-                log(f"[model-service] BM25 构建失败（该库 BM25 通道降级）: {e}")
-                _bm25_retrievers[kb_id] = None
-                return None
-    return None
+                continue  # 构建期间有写，重试
+            retriever = BM25Retriever.from_documents(
+                docs, k=BM25_POOL_K, preprocess_func=_jieba_tokenize)
+        except Exception as e:
+            log(f"[model-service] BM25 构建失败（该库 BM25 通道降级）: {e}")
+            _bm25_retrievers[kb_id] = None
+            return None
+        # 小临界区②：代际检查+落缓存，与 _invalidate_bm25 的 gen++/pop 互斥
+        with _store_open_lock:
+            if _bm25_gen.get(kb_id, 0) != gen_before:
+                continue  # 构建期间有写，丢弃本次索引重建
+            _bm25_retrievers[kb_id] = retriever
+            break
+    else:
+        log(f"[model-service] BM25 构建 3 次均被写入打断，该库暂降级（下次检索重建）")
+        return None
+    log(f"[model-service] 已构建 BM25 索引: {kb_id} ({len(docs)} 块，服务常驻)")
+    return retriever
 
 
 def _preopen_stores():
@@ -368,11 +395,18 @@ class _Handler(BaseHTTPRequestHandler):
                 if not texts:
                     self._json({"error": "texts 为空"}, 400)
                     return
+                t_w0 = time.perf_counter()
                 with _infer_lock:
+                    t_wait = time.perf_counter() - t_w0
+                    t_h0 = time.perf_counter()
                     # 服务端分批编码，防止直连调用方一次塞超大列表撑爆内存
                     embs = []
                     for i in range(0, len(texts), 32):
                         embs.extend(_embeddings_model.embed_documents(texts[i:i + 32]))
+                    t_hold = time.perf_counter() - t_h0
+                # A 埋点（2026-11-09）：锁外打日志（utils.log 带文件 IO，锁内只记 perf_counter）
+                log(f"[perf] /embed caller={payload.get('caller', 'unknown')} n={len(texts)} "
+                    f"等锁={t_wait * 1000:.0f}ms 持锁={t_hold * 1000:.0f}ms")
                 self._json({"embeddings": embs})
             elif self.path == "/split":
                 # 文档切分上移（2026-08-23）：服务端 splitter 常驻热加载，
@@ -394,8 +428,14 @@ class _Handler(BaseHTTPRequestHandler):
                 if not pairs:
                     self._json({"error": "pairs 为空"}, 400)
                     return
+                t_w0 = time.perf_counter()
                 with _infer_lock:
+                    t_wait = time.perf_counter() - t_w0
+                    t_h0 = time.perf_counter()
                     scores = [float(s) for s in _reranker_model.predict(pairs)]
+                    t_hold = time.perf_counter() - t_h0
+                log(f"[perf] /rerank caller={payload.get('caller', 'unknown')} n={len(pairs)} "
+                    f"等锁={t_wait * 1000:.0f}ms 持锁={t_hold * 1000:.0f}ms")
                 self._json({"scores": scores})
             elif self.path == "/vector_query":
                 kb_id = validate_kb_id(payload.get("kb_id", ""))
@@ -446,7 +486,10 @@ class _Handler(BaseHTTPRequestHandler):
                     return
                 if not kb_vectordb_path(kb_id).exists():
                     kb_vectordb_path(kb_id).mkdir(parents=True, exist_ok=True)
+                t_open0 = time.perf_counter()
                 store = _open_store(kb_id, collection)
+                # A 埋点：开库等待单列相位（首开含 msvcrt 跨进程锁，勿并入等推理锁）
+                t_open = time.perf_counter() - t_open0
                 if store is None:
                     self._json({"error": "vector store unavailable"}, 503)
                     return
@@ -457,21 +500,57 @@ class _Handler(BaseHTTPRequestHandler):
                         return
                     texts = [str(d.get("page_content", "")) for d in docs_in]
                     metas = [d.get("metadata") or {} for d in docs_in]
-                    # S4 幂等：客户端传确定性 uuid5 ids（source+序号）时 delete-then-add，
-                    # 超时重试不会重复写入；无 ids（老客户端）退回旧 add_documents 行为
+                    # S4 幂等：客户端传确定性 uuid5 ids（source+序号）；add_texts 三分支
+                    # 实为 collection.upsert（同号覆写），重试幂等天然成立
                     ids = [str(i) for i in payload.get("ids", []) if i]
+                    # add-then-prune（2026-10-30 换序防消失）：先写后剪，中断在任何时点
+                    # 文档不消失（断在写前=旧内容完整可搜；断在写后=新旧混杂，下次成功
+                    # 索引自愈）；单源守卫：全部块同一非空 source 才剪，防误删他源
+                    srcs = {m.get("source") for m in metas if m.get("source")}
+                    pruned = 0
+                    src = None
+                    t_w0 = time.perf_counter()
+                    t_add = t_pget = t_pdel = 0.0
                     with _infer_lock:
+                        t_wait = time.perf_counter() - t_w0
                         # CC 审查 B2 修复：add_texts 内部在服务端模型上做嵌入推理，
-                        # 必须与 /embed /rerank 同走 _infer_lock（torch 推理全串行化不变量）
+                        # 必须与 /embed /rerank 同走 _infer_lock（torch 推理全串行化不变量）；
+                        # prune 同临界区顺带把同文件并发写串行化为"后写者整版覆盖"
                         if ids and len(ids) == len(texts):
-                            store.delete(ids=ids)
+                            t_a0 = time.perf_counter()
                             store.add_texts(texts, metadatas=metas, ids=ids)
+                            t_add = time.perf_counter() - t_a0
+                            if len(srcs) == 1:
+                                src = srcs.pop()
+                                # prune ids-only（2026-11-09）：include 只留 metadatas，
+                                # ids 恒返回（langchain_chroma get 契约），免拉全量文档文本
+                                t_g0 = time.perf_counter()
+                                got = store.get(where={"source": src}, include=["metadatas"])
+                                t_pget = time.perf_counter() - t_g0
+                                stale = [i for i in got.get("ids", []) if i not in set(ids)]
+                                if stale:
+                                    t_d0 = time.perf_counter()
+                                    store.delete(ids=stale)
+                                    t_pdel = time.perf_counter() - t_d0
+                                    pruned = len(stale)
                         else:
+                            # 无 ids（老客户端）：add_texts 内部生成随机 id，无法集合差剪旧，
+                            # 维持纯 add（调用方自行 delete）
+                            t_a0 = time.perf_counter()
                             store.add_texts(texts, metadatas=metas)
+                            t_add = time.perf_counter() - t_a0
+                    if pruned:
+                        log(f"[model-service] add-then-prune 剪除 {pruned} 旧块 (source={src})")
+                    # A 埋点（2026-11-09）：分相耗时锁外一行——尖峰归因（嵌入/写库/prune
+                    # 谁是大头）与 B2' keep_ids 契约是否值得扩展的决策数据
+                    log(f"[perf] /vector_write caller={payload.get('caller', 'unknown')} kb={kb_id} "
+                        f"n={len(texts)} 开库={t_open * 1000:.0f}ms 等锁={t_wait * 1000:.0f}ms "
+                        f"add_texts={t_add * 1000:.0f}ms prune_get={t_pget * 1000:.0f}ms "
+                        f"prune_del={t_pdel * 1000:.0f}ms pruned={pruned}")
                     # BM25 只建在主库上；sections 写入不触发主库 BM25 重建
                     if collection == "main":
                         _invalidate_bm25(kb_id)
-                    self._json({"added": len(texts)})
+                    self._json({"added": len(texts), "pruned": pruned})
                 else:
                     ids = [str(i) for i in payload.get("ids", [])]
                     if not ids:
@@ -514,6 +593,10 @@ class _ModelHTTPServer(ThreadingHTTPServer):
 
 
 def main():
+    # A0（2026-10-30）：原生崩溃（访问违例等）时打线程栈；stderr 已由 _spawn_service
+    # 重定向进 model_service.log。卡死型不归它管（handler 已有异常 log 兜底）
+    import faulthandler
+    faulthandler.enable()
     log(f"[model-service] 启动 {MODEL_SERVICE_HOST}:{MODEL_SERVICE_PORT}")
     httpd = None
     # 绑定失败重试：要么另一实例已在跑（重试耗尽后退出，调用方 ping 命中先来者），
