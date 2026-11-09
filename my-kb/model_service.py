@@ -57,6 +57,26 @@ _infer_lock = threading.Lock()  # torch 推理串行化（GPU 本就串行，避
 # "同文件并发写串行化为后写者整版覆盖"角色；add+prune 的原子性与写序由本锁保证，
 # _infer_lock 退回纯推理串行化本职。锁序恒为 _write_lock → _infer_lock（无反序路径）。
 _write_lock = threading.Lock()
+
+
+def _gpu_watermark():
+    """GPU 显存水位（驱动级读数，含全部进程占用）；21.11 尖峰归因用（sysmem 回退与水位强相关）。"""
+    try:
+        import torch
+        free, total = torch.cuda.mem_get_info()
+        return f"{(total - free) // 1048576}/{total // 1048576}MiB"
+    except Exception:
+        return "n/a"
+
+
+def _gpu_free_cache():
+    """释放 torch 显存分配器缓存块，降水位缓解长序列嵌入 sysmem 回退（21.11 坑，陛下拍板②）。"""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 _embeddings_model = None
 _reranker_model = None
 
@@ -400,17 +420,21 @@ class _Handler(BaseHTTPRequestHandler):
                     self._json({"error": "texts 为空"}, 400)
                     return
                 t_w0 = time.perf_counter()
+                wm = _gpu_watermark()
                 with _infer_lock:
                     t_wait = time.perf_counter() - t_w0
                     t_h0 = time.perf_counter()
-                    # 服务端分批编码，防止直连调用方一次塞超大列表撑爆内存
+                    # 服务端分批编码（批 32→8，21.11 缓解①：小批缩激活足迹，防长序列
+                    # 在显存高位触发 sysmem 回退），防止直连调用方一次塞超大列表撑爆内存
                     embs = []
-                    for i in range(0, len(texts), 32):
-                        embs.extend(_embeddings_model.embed_documents(texts[i:i + 32]))
+                    for i in range(0, len(texts), 8):
+                        embs.extend(_embeddings_model.embed_documents(texts[i:i + 8]))
                     t_hold = time.perf_counter() - t_h0
+                if len(texts) > 8:
+                    _gpu_free_cache()  # 锁外释放缓存块降水位（缓解②）
                 # A 埋点（2026-11-09）：锁外打日志（utils.log 带文件 IO，锁内只记 perf_counter）
                 log(f"[perf] /embed caller={payload.get('caller', 'unknown')} n={len(texts)} "
-                    f"等锁={t_wait * 1000:.0f}ms 持锁={t_hold * 1000:.0f}ms")
+                    f"等锁={t_wait * 1000:.0f}ms 持锁={t_hold * 1000:.0f}ms 水位={wm}")
                 self._json({"embeddings": embs})
             elif self.path == "/split":
                 # 文档切分上移（2026-08-23）：服务端 splitter 常驻热加载，
@@ -439,7 +463,7 @@ class _Handler(BaseHTTPRequestHandler):
                     scores = [float(s) for s in _reranker_model.predict(pairs)]
                     t_hold = time.perf_counter() - t_h0
                 log(f"[perf] /rerank caller={payload.get('caller', 'unknown')} n={len(pairs)} "
-                    f"等锁={t_wait * 1000:.0f}ms 持锁={t_hold * 1000:.0f}ms")
+                    f"等锁={t_wait * 1000:.0f}ms 持锁={t_hold * 1000:.0f}ms 水位={_gpu_watermark()}")
                 self._json({"scores": scores})
             elif self.path == "/vector_query":
                 kb_id = validate_kb_id(payload.get("kb_id", ""))
@@ -513,6 +537,7 @@ class _Handler(BaseHTTPRequestHandler):
                     srcs = {m.get("source") for m in metas if m.get("source")}
                     pruned = 0
                     src = None
+                    wm = _gpu_watermark()
                     t_wl0 = time.perf_counter()
                     t_wait = t_embed = t_add = t_pget = t_pdel = 0.0
                     with _write_lock:
@@ -529,10 +554,12 @@ class _Handler(BaseHTTPRequestHandler):
                             with _infer_lock:
                                 t_wait = time.perf_counter() - t_il0
                                 t_e0 = time.perf_counter()
+                                # 批 32→8（21.11 缓解①）：小批缩激活足迹防 sysmem 回退
                                 embs = []
-                                for i in range(0, len(texts), 32):
-                                    embs.extend(_embeddings_model.embed_documents(texts[i:i + 32]))
+                                for i in range(0, len(texts), 8):
+                                    embs.extend(_embeddings_model.embed_documents(texts[i:i + 8]))
                                 t_embed = time.perf_counter() - t_e0
+                            _gpu_free_cache()  # 大写后释放缓存块降水位（缓解②，写锁内无读者竞争）
                             t_a0 = time.perf_counter()
                             store._collection.upsert(ids=ids, embeddings=embs,
                                                      documents=texts, metadatas=metas)
@@ -560,9 +587,9 @@ class _Handler(BaseHTTPRequestHandler):
                                 t_add = time.perf_counter() - t_a0
                     if pruned:
                         log(f"[model-service] add-then-prune 剪除 {pruned} 旧块 (source={src})")
-                    # A 埋点（第一步）+ B1 分相：等写锁/等推理锁/嵌入/upsert 各自独立可归因
+                    # A 埋点（第一步）+ B1 分相 + 21.11 水位（请求起点读数，回退归因用）
                     log(f"[perf] /vector_write caller={payload.get('caller', 'unknown')} kb={kb_id} "
-                        f"n={len(texts)} 开库={t_open * 1000:.0f}ms 等写锁={t_wwait * 1000:.0f}ms "
+                        f"n={len(texts)} 水位={wm} 开库={t_open * 1000:.0f}ms 等写锁={t_wwait * 1000:.0f}ms "
                         f"等锁={t_wait * 1000:.0f}ms 嵌入={t_embed * 1000:.0f}ms "
                         f"upsert={t_add * 1000:.0f}ms prune_get={t_pget * 1000:.0f}ms "
                         f"prune_del={t_pdel * 1000:.0f}ms pruned={pruned}")
