@@ -53,6 +53,10 @@ _CHROMA_OPEN_LOCK_PATH = Path(__file__).resolve().parent / "chroma_open.lock"
 
 _state = {"ready": False, "started_at": time.time(), "last_request": time.time()}
 _infer_lock = threading.Lock()  # torch 推理串行化（GPU 本就串行，避免并发内部状态问题)
+# B1（2026-11-09 第二步，MiMo r1 定稿）：向量写-写互斥专用锁——接管 _infer_lock 原兼职的
+# "同文件并发写串行化为后写者整版覆盖"角色；add+prune 的原子性与写序由本锁保证，
+# _infer_lock 退回纯推理串行化本职。锁序恒为 _write_lock → _infer_lock（无反序路径）。
+_write_lock = threading.Lock()
 _embeddings_model = None
 _reranker_model = None
 
@@ -509,21 +513,33 @@ class _Handler(BaseHTTPRequestHandler):
                     srcs = {m.get("source") for m in metas if m.get("source")}
                     pruned = 0
                     src = None
-                    t_w0 = time.perf_counter()
-                    t_add = t_pget = t_pdel = 0.0
-                    with _infer_lock:
-                        t_wait = time.perf_counter() - t_w0
-                        # CC 审查 B2 修复：add_texts 内部在服务端模型上做嵌入推理，
-                        # 必须与 /embed /rerank 同走 _infer_lock（torch 推理全串行化不变量）；
-                        # prune 同临界区顺带把同文件并发写串行化为"后写者整版覆盖"
+                    t_wl0 = time.perf_counter()
+                    t_wait = t_embed = t_add = t_pget = t_pdel = 0.0
+                    with _write_lock:
+                        t_wwait = time.perf_counter() - t_wl0
                         if ids and len(ids) == len(texts):
+                            # B1（2026-11-09 第二步）：嵌入仍走 _infer_lock（torch 推理串行化
+                            # 不变量），chroma 写 IO 挪出推理锁（实测占写耗时 ~90%，原样锁内
+                            # 则整段写期间所有检索排队）；写-写互斥由外层 _write_lock 提供，
+                            # add+prune 原子（"后写者整版覆盖"语义保持）。add_texts 拆两步：
+                            # embed_documents + _collection.upsert（langchain_chroma 无
+                            # add_embeddings 公开面；本项目 metadata 全字符串标量，跳过
+                            # add_texts 格式检查风险可忽略——MiMo r1 已核）。S4 幂等不变。
+                            t_il0 = time.perf_counter()
+                            with _infer_lock:
+                                t_wait = time.perf_counter() - t_il0
+                                t_e0 = time.perf_counter()
+                                embs = []
+                                for i in range(0, len(texts), 32):
+                                    embs.extend(_embeddings_model.embed_documents(texts[i:i + 32]))
+                                t_embed = time.perf_counter() - t_e0
                             t_a0 = time.perf_counter()
-                            store.add_texts(texts, metadatas=metas, ids=ids)
+                            store._collection.upsert(ids=ids, embeddings=embs,
+                                                     documents=texts, metadatas=metas)
                             t_add = time.perf_counter() - t_a0
                             if len(srcs) == 1:
                                 src = srcs.pop()
-                                # prune ids-only（2026-11-09）：include 只留 metadatas，
-                                # ids 恒返回（langchain_chroma get 契约），免拉全量文档文本
+                                # prune ids-only（第一步）：include 只留 metadatas，ids 恒返回
                                 t_g0 = time.perf_counter()
                                 got = store.get(where={"source": src}, include=["metadatas"])
                                 t_pget = time.perf_counter() - t_g0
@@ -535,17 +551,20 @@ class _Handler(BaseHTTPRequestHandler):
                                     pruned = len(stale)
                         else:
                             # 无 ids（老客户端）：add_texts 内部生成随机 id，无法集合差剪旧，
-                            # 维持纯 add（调用方自行 delete）
-                            t_a0 = time.perf_counter()
-                            store.add_texts(texts, metadatas=metas)
-                            t_add = time.perf_counter() - t_a0
+                            # 维持纯 add（调用方自行 delete）；仍整段推理锁（保守无拆分收益）
+                            t_il0 = time.perf_counter()
+                            with _infer_lock:
+                                t_wait = time.perf_counter() - t_il0
+                                t_a0 = time.perf_counter()
+                                store.add_texts(texts, metadatas=metas)
+                                t_add = time.perf_counter() - t_a0
                     if pruned:
                         log(f"[model-service] add-then-prune 剪除 {pruned} 旧块 (source={src})")
-                    # A 埋点（2026-11-09）：分相耗时锁外一行——尖峰归因（嵌入/写库/prune
-                    # 谁是大头）与 B2' keep_ids 契约是否值得扩展的决策数据
+                    # A 埋点（第一步）+ B1 分相：等写锁/等推理锁/嵌入/upsert 各自独立可归因
                     log(f"[perf] /vector_write caller={payload.get('caller', 'unknown')} kb={kb_id} "
-                        f"n={len(texts)} 开库={t_open * 1000:.0f}ms 等锁={t_wait * 1000:.0f}ms "
-                        f"add_texts={t_add * 1000:.0f}ms prune_get={t_pget * 1000:.0f}ms "
+                        f"n={len(texts)} 开库={t_open * 1000:.0f}ms 等写锁={t_wwait * 1000:.0f}ms "
+                        f"等锁={t_wait * 1000:.0f}ms 嵌入={t_embed * 1000:.0f}ms "
+                        f"upsert={t_add * 1000:.0f}ms prune_get={t_pget * 1000:.0f}ms "
                         f"prune_del={t_pdel * 1000:.0f}ms pruned={pruned}")
                     # BM25 只建在主库上；sections 写入不触发主库 BM25 重建
                     if collection == "main":
@@ -556,7 +575,8 @@ class _Handler(BaseHTTPRequestHandler):
                     if not ids:
                         self._json({"error": "ids 为空"}, 400)
                         return
-                    store.delete(ids=ids)  # 公开 API；会话端已统一 delete(ids=)，同风格
+                    with _write_lock:  # B1：与 add 同写序，delete 不再与同源 add 竞态交错
+                        store.delete(ids=ids)  # 公开 API；会话端已统一 delete(ids=)，同风格
                     if collection == "main":
                         _invalidate_bm25(kb_id)
                     self._json({"deleted": len(ids)})
